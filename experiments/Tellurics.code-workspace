@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../ai-tfm-tellurics"
+		},
+		{
+			"path": "../../Tellurics_data"
+		}
+	]
+}

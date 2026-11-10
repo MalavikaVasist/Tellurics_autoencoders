@@ -1,0 +1,14 @@
+name: tellurics
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - requests
+  - matplotlib
+  - fortranformat
+  - ipykernel
+  - h5py
+  - tqdm
+  - pandas
+prefix: /home/mvasist/miniconda3/envs/tellurics

@@ -1,0 +1,145 @@
+For the code to run, 
+1. you first need to run python Tellurics/simulations/phoenix/download_pool.py. This will download some 20 stars in the Tellurics/simulation/phoenix/configs
+/phoenix_pool.csv file, and convolve and resample them to the grid with 51557 data points. These are stored as fits files. then when the datamodule is loaded, it  randomly generates star indices  per night and combines their spectra with the tellurics just before training. 
+2. run testing_dataset_reshape.ipynb to reshape the dataset.
+3. Then you can run python -m tellurics.scripts.train --config experiments/experiment1.yaml --device gpu
+4. sweep across parameters, 
+spectral_latent_dim
+metadata_enc_dim
+time_enc_dim
+num_queries
+num_heads
+fusion_hidden
+fusion_layers
+dropout
+param_decoder_hidden
+metadata_enc_hidden
+
+Main architecture: 
+
+d = spectral_latent_dim
+C = metadata_enc_dim
+k = time_enc_dim
+Q = num_queries
+
+per-exposure token before Perceiver:
+    d + C + k
+
+after pre_temporal:
+    d
+
+Perceiver latent:
+    Q × d
+
+flattened night representation:
+    Q*d
+
+fusion input:
+    Q*d + d
+
+fusion output:
+    Q*d
+
+d = 32 / 64 / 128
+C = 8 / 16 / 32
+k = 8 / 16 / 32
+Q = 4 / 8 / 16 / 32
+
+
+
+Tellurics/
+├── src/
+│   └── tellurics/
+│       ├── config/
+│       │   ├── __init__.py
+│       │   ├── parameters.py
+│       │   ├── data.py
+│       │   ├── experiment.py
+│       │   ├── model.py
+│       │   ├── training.py
+│       │   └── wandb.py
+│       │
+│       ├── data/
+│       │   ├── datasets/
+│       │   │   ├── __init__.py
+│       │   │   └── timeseries.py
+│       │   ├── __init__.py
+│       │   ├── datamodule.py
+│       │   ├── scaling.py
+│       │   ├── splits.py
+│       │   ├── stellar.py
+│       │   └── wavegrid.py
+│       │
+│       ├── models/
+│       │   ├── decoders/
+│       │   ├── encoders/
+│       │   ├── temporal/
+│       │   ├── __init__.py
+│       │   ├── fusion.py
+│       │   ├── predictor.py
+│       │   └── output.py
+│       │
+│       ├── training/
+│       │   ├── __init__.py
+│       │   └── module.py
+│       │
+│       ├── scripts/
+│       │   ├── __init__.py
+│       │   └── train.py
+│       │
+│       ├── utils/
+│       │   ├── __init__.py
+│       │   ├── logging.py
+│       │   └── registry.py
+│       │
+│       └── __init__.py
+│
+├── experiments/
+│   ├── experiment1.yaml
+│   └── experiment1_smoke.yaml
+│
+├── tools/
+│   └── verify_temporal_model.py
+│
+├── simulation/
+│   ├── combine/
+│   ├── phoenix/
+│   ├── telluric/
+│   └── utils/
+│
+├── tests/
+├── runs/
+├── site_parameter_evolution/
+├── .gitignore
+├── environment.yml
+├── notes.txt
+├── pyproject.toml
+└── README.md
+
+
+Data (external; located via $TELLURICS_DATA)
+The repo and the data bundle live in different directories. Manifests reference
+the root with a placeholder that load_config expands from the environment:
+
+    data:
+      root: "${TELLURICS_DATA}"
+      night_h5: telluric_timeseries/telluric_templates_nights.h5
+      phoenix_dir: phoenix/convolved
+
+    export TELLURICS_DATA="$HOME/Documents/Tellurics_data"     # e.g.
+    export TELLURICS_DATA="/scratch/$USER/Tellurics_data"      # scratch
+
+Tellurics_data/
+├── phoenix/            # raw + convolved PHOENIX spectra
+├── telluric_timeseries/
+└── telfit/             # TelFit distribution (src/, data/, telluric_templates/)
+
+
+Installing TelFit
+The TelFit distribution is NOT vendored in this repo. It lives in the data
+bundle (default Tellurics_data/telfit) or anywhere on scratch, and the
+simulation scripts find it via $TELFIT_HOME (fallback:
+<repo>/../Tellurics_data/telfit) -- see simulation/utils/telfit_home.py.
+
+    export TELFIT_HOME=/scratch/<user>/Tellurics_data/telfit
+    python -m pip install --no-build-isolation -e "$TELFIT_HOME"

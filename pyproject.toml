@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tellurics"
+version = "0.1.0"
+description = "Physics-informed deep learning for telluric correction and exoplanet signal recovery"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Tellurics Team"},
+]
+dependencies = [
+    "torch>=2.2.0",
+    "pytorch-lightning>=2.2.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.1.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+    "h5py>=3.10.0",
+    "astropy>=6.0.0",
+    "rich>=13.7.0",
+    "wandb>=0.16.0",
+    "matplotlib>=3.8.0",
+    "scipy>=1.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+tellurics-train = "tellurics.scripts.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "ANN", "B", "A", "COM", "C4", "PT"]
+ignore = ["ANN101", "ANN102", "ANN401", "COM812"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tellurics"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

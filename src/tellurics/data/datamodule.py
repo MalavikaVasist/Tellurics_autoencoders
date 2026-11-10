@@ -1,0 +1,249 @@
+"""
+Lightning DataModule for whole-night telluric training.
+
+Combines the shared wavelength grid, PHOENIX stellar spectra, night-level
+train/validation/test splits, and the timeseries dataset. Each dataset
+sample represents one complete night of observations.
+
+Each night is paired with one fixed, seeded stellar spectrum:
+    observed = transmission * stellar_flux
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader, Dataset
+
+from tellurics.config.data import DataConfig
+from tellurics.data.datasets.timeseries import (
+    METADATA_COLUMNS,
+    TARGET_COLUMNS,
+    TIME_COLUMN,
+    TelluricTimeseriesDataset,
+)
+from tellurics.data.scaling import ParameterScaler
+from tellurics.data.splits import split_night_indices, split_night_indices_order
+from tellurics.data.stellar import (
+    StellarPool,
+    assign_stellar_per_night,
+    save_stellar_assignment,
+)
+from tellurics.data.wavegrid import Wavegrid
+from tellurics.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
+    """Build the ``[0, 1]`` label scaler described by a ``data:`` section.
+
+    A pure function of ``data.param_bounds`` and the three ``data.scale_*``
+    flags: no statistic is read off the data and no split is involved, so the
+    scaler is identical for train/val/test and can be rebuilt from a run's
+    ``config.yaml`` alone -- which is how a prediction is mapped back to
+    physical units at inference time::
+
+        scaler = build_scaler(load_config("runs/<run>/config.yaml").data)
+        physical = scaler.inverse_params(pred.params)
+
+    With ``clip`` the forward transform clamps physical values to the declared
+    bounds instead of raising. The data module enables it for the test split
+    only, where ``float32`` storage can put a value marginally outside the
+    declared envelope.
+    """
+    return ParameterScaler.from_bounds(
+        config.param_bounds.to_mapping(),
+        metadata_columns=METADATA_COLUMNS,
+        target_columns=TARGET_COLUMNS,
+        time_column=TIME_COLUMN,
+        scale_metadata=config.scale_metadata,
+        scale_params=config.scale_params,
+        scale_time=config.scale_time,
+        clip=clip,
+    )
+
+
+class TelluricDataModule(pl.LightningDataModule):
+    """Whole-night DataModule for training the :class:`NeuralTelluricPredictor`.
+
+    Args:
+        config: Input paths and night-level split settings (the manifest's
+            ``data:`` section).
+        run_dir: This run's artefact directory; the night -> star audit CSV is
+            written to ``<run_dir>/stellar_assignment.csv``.
+        batch_size: Whole nights per batch (the manifest's ``training:``
+            section).
+        num_workers: DataLoader workers (the manifest's ``training:`` section).
+    """
+
+    def __init__(
+        self,
+        config: DataConfig,
+        run_dir: str | Path,
+        batch_size: int = 4,
+        num_workers: int = 2,
+    ) -> None:
+        """Initialize."""
+        super().__init__()
+        self.save_hyperparameters()
+        self.config = config
+        self.run_dir = Path(run_dir)
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    # -- attributes set by setup() ------------------------------------------ #
+    wavegrid: Wavegrid | None = None
+    stellar_pool: StellarPool | None = None
+    stellar_assignment: np.ndarray | None = None      # (n_nights,) star indices
+    scaler: ParameterScaler | None = None             # [0,1] label scaling
+    n_nights: int = 0
+    n_frames: int = 0
+    train_ids: list[int] = []
+    val_ids: list[int] = []
+    test_ids: list[int] = []
+    train_ds: TelluricTimeseriesDataset | None = None
+    val_ds: TelluricTimeseriesDataset | None = None
+    test_ds: TelluricTimeseriesDataset | None = None
+
+    # -- setup -------------------------------------------------------------- #
+    def setup(self, stage: str | None = None) -> None:
+        """Prepare metadata, splits, star assignment and datasets (once)."""
+        if self.train_ds is not None:
+            return
+
+        self._load_metadata()  # shapes + wavelength grid
+        self._make_scaler()    # [0,1] scaling from the declared bounds
+        self._make_splits()    # night-level train/val/test
+        self._assign_stars()   # fixed stellar spectrum per night + audit CSV
+        self._make_datasets()  # one dataset per split
+
+    def _load_metadata(self) -> None:
+        """Read the shapes and the wavelength grid."""
+        night_h5 = Path(self.config.night_h5)
+        if not night_h5.exists():
+            raise FileNotFoundError(
+                f"night-major HDF5 not found at {night_h5}. It is resolved "
+                "relative to $TELLURICS_DATA -- check that the variable points "
+                "at the data directory and that the file exists. Create it "
+                "once with tests/testing_dataset_reshape.ipynb."
+            )
+
+        import h5py
+
+        with h5py.File(night_h5, "r") as f:
+            available_nights = int(f["transmission"].shape[0])
+            self.n_frames = int(f["transmission"].shape[1])
+            wl = np.asarray(f["wavelength"][:], np.float64)
+            unit = str(f["wavelength"].attrs.get("unit", "nm"))
+
+        # Debug/smoke runs may cap the nights used (the first N); the split and
+        # the star assignment then only cover those nights.
+        self.n_nights = available_nights
+        cap = self.config.max_nights
+        if cap is not None and cap < available_nights:
+            self.n_nights = cap
+            logger.warning(
+                f"data.max_nights={cap}: using only the first {cap} of "
+                f"{available_nights} nights (smoke/debug subset)."
+            )
+
+        self.wavegrid = Wavegrid(wavelength=wl, unit=unit)
+        logger.info(
+            f"{self.n_nights} nights x {self.n_frames} frames from {night_h5}"
+        )
+
+
+    def _make_scaler(self) -> None:
+        """Build the ``[0, 1]`` scaler from the manifest's declared bounds.
+        """
+        self.scaler = build_scaler(self.config)
+        if not any(
+            (self.scaler.scale_metadata, self.scaler.scale_params,
+             self.scaler.scale_time)
+        ):
+            logger.info(
+                "data.scale_metadata/scale_params/scale_time are all false: "
+                "labels are fed to the model in physical units."
+            )
+
+    def _make_splits(self) -> None:
+        """Night-level train/val/test split (no exposure crosses splits)."""
+        self.train_ids, self.val_ids, self.test_ids = split_night_indices(
+            self.n_nights,
+            self.config.train_fraction,
+            self.config.val_fraction,
+            self.config.seed,
+        )
+
+    def _assign_stars(self) -> None:
+        """Assign a fixed stellar spectrum per night and write the audit CSV."""
+        self.stellar_pool = StellarPool(
+            self.config.phoenix_dir, scale=self.config.stellar_scale
+        )
+        self.stellar_assignment = assign_stellar_per_night(
+            self.n_nights, self.stellar_pool, seed=self.config.seed
+        )
+        audit_csv = self.run_dir / "stellar_assignment.csv"
+        save_stellar_assignment(
+            self.stellar_assignment,
+            self.stellar_pool,
+            {"train": self.train_ids, "val": self.val_ids, "test": self.test_ids},
+            audit_csv,
+        )
+        logger.info(
+            f"train {len(self.train_ids)} / val {len(self.val_ids)} / "
+            f"test {len(self.test_ids)}; stellar audit -> {audit_csv}"
+        )
+
+  
+    def _make_datasets(self) -> None:
+        """Wrap each split in a :class:`TelluricTimeseriesDataset`.
+
+        The test split gets a clipping scaler: labels are stored as
+        ``float32``, so a frame on a declared bound can scale marginally
+        outside ``[0, 1]`` and would otherwise raise. Train and validation
+        stay strict so a mis-declared bound still fails loudly.
+        """
+        common = dict(
+            h5_path=self.config.night_h5,
+            pool=self.stellar_pool,
+            star_assignment=self.stellar_assignment,
+        )
+        test_scaler = (
+            None if self.scaler is None else build_scaler(self.config, clip=True)
+        )
+        self.train_ds = TelluricTimeseriesDataset(
+            night_ids=self.train_ids, scaler=self.scaler, **common
+        )
+        self.val_ds = TelluricTimeseriesDataset(
+            night_ids=self.val_ids, scaler=self.scaler, **common
+        )
+        self.test_ds = TelluricTimeseriesDataset(
+            night_ids=self.test_ids, scaler=test_scaler, **common
+        )
+
+    # -- loaders ------------------------------------------------------------ #
+    def _loader(self, ds: TelluricTimeseriesDataset, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.config.pin_memory,
+            drop_last=shuffle,  # drop partial training batch only
+        )
+
+    def train_dataloader(self) -> DataLoader:
+        return self._loader(self.train_ds, shuffle=True)
+
+    def val_dataloader(self) -> DataLoader:
+        return self._loader(self.val_ds, shuffle=False)
+
+    def test_dataloader(self) -> DataLoader:
+        return self._loader(self.test_ds, shuffle=False)
+
+    def predict_dataloader(self) -> DataLoader:
+        return self._loader(self.test_ds, shuffle=False)

@@ -1,0 +1,120 @@
+Metadata-Version: 2.4
+Name: tellurics
+Version: 0.1.0
+Summary: Physics-informed deep learning for telluric correction and exoplanet signal recovery
+Author: Tellurics Team
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.2.0
+Requires-Dist: pytorch-lightning>=2.2.0
+Requires-Dist: pydantic>=2.6.0
+Requires-Dist: pydantic-settings>=2.1.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: h5py>=3.10.0
+Requires-Dist: astropy>=6.0.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: wandb>=0.16.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: scipy>=1.12.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: ruff>=0.3.0; extra == "dev"
+Requires-Dist: mypy>=1.8.0; extra == "dev"
+
+# Tellurics
+
+Physics-informed deep learning pipeline for telluric correction and exoplanet signal recovery from high-resolution spectroscopy.
+
+## Scientific Background
+
+The observed spectrum decomposes as:
+
+$$X(t, \lambda) = S(\lambda) \cdot T_{\text{tell}}(t,\lambda) \cdot P(t,\lambda) + \epsilon$$
+
+This package trains a neural network to predict the telluric transmission:
+
+$$f(R, \text{atmospheric parameters}) \rightarrow T_{\text{tell}}$$
+
+where $R = X / S$, enabling recovery of the planetary signal:
+
+$$\hat{P} = \frac{X/S}{\hat{T}_{\text{tell}}}$$
+
+## Installation
+
+```bash
+pip install -e ".[dev]"
+```
+
+## Data (`TELLURICS_DATA`)
+
+Training and simulation read external data (night HDF5, PHOENIX pool) from a
+per-machine root. The manifests reference it with a `${TELLURICS_DATA}`
+placeholder, which `load_config` expands from the environment (YAML does not
+expand variables on its own):
+
+```yaml
+data:
+  root: "${TELLURICS_DATA}"
+  night_h5: telluric_timeseries/telluric_templates_nights.h5
+  phoenix_dir: phoenix/convolved
+```
+
+```bash
+export TELLURICS_DATA="$HOME/Documents/Tellurics_data"   # e.g.
+# or, on scratch:
+export TELLURICS_DATA="/scratch/$USER/Tellurics_data"
+```
+
+Because every data path is relative to `root`, no tracked YAML or Python file
+contains a machine-specific path.
+
+Expected layout under `$TELLURICS_DATA`:
+
+```
+Tellurics_data/
+├── phoenix/convolved/                        # convolved stellar spectra
+├── telluric_timeseries/telluric_templates_nights.h5
+└── telfit/                                   # TelFit distribution
+```
+
+If the variable is unset, or the expected files are missing, training stops
+with an actionable error (`src/tellurics/config/paths.py`).
+
+## Quick Start
+
+```python
+from tellurics.inference import InferencePipeline
+from tellurics.config import InferenceConfig
+
+config = InferenceConfig(checkpoint_path="path/to/model.ckpt")
+pipeline = InferencePipeline(config)
+output = pipeline.predict(observed_spectrum, stellar_template, atm_params)
+print(output.telluric.shape)
+```
+
+## Project Structure
+
+```
+src/tellurics/
+├── configs/         # Pydantic configuration models
+├── data/            # Datasets and DataModules
+├── preprocessing/   # Wavelength alignment, normalization, masking
+├── models/          # Neural network architectures
+├── losses/          # Modular loss functions
+├── training/        # Lightning training module
+├── evaluation/      # Metrics and plotting
+├── inference/       # Production inference pipeline
+├── utils/           # Logging, registry, helpers
+└── scripts/         # CLI entry points
+```
+
+## Development
+
+```bash
+ruff check src/ tests/
+mypy src/
+pytest
+```
