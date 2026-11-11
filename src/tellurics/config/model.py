@@ -1,6 +1,25 @@
-"""Model configuration."""
+"""Model configuration: one config class per architecture.
+
+The ``model:`` section of a manifest is validated against exactly one of the
+classes below, selected by its ``architecture`` value (a pydantic
+discriminated union, :data:`AnyModelConfig`). Each experiment therefore only
+states the fields of its own model:
+
+=============================  ==============================  ===============
+``architecture``               config class                    sample
+=============================  ==============================  ===============
+``neural_telluric_predictor``  :class:`ModelConfig`            whole night
+``cnn_autoencoder``            :class:`CNNAutoencoderConfig`   single frame
+``transformer_autoencoder``    :class:`TransformerAutoencoderConfig`  single frame
+``specpt``                     :class:`SpecPTConfig`           single frame
+=============================  ==============================  ===============
+
+``single_frame`` (a class constant) tells the training script which dataset
+to build: whole nights ``(B, T, N)`` or single exposures ``(B, 1, N)``.
+"""
 
 from enum import Enum
+from typing import Annotated, ClassVar, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -9,41 +28,41 @@ class ModelArchitecture(str, Enum):
     """Available model architectures (``ModelRegistry`` ids)."""
 
     NEURAL_TELLURIC_PREDICTOR = "neural_telluric_predictor"
+    CNN_AUTOENCODER = "cnn_autoencoder"
+    TRANSFORMER_AUTOENCODER = "transformer_autoencoder"
+    SPECPT = "specpt"
 
 
-class ParamActivation(str, Enum):
-    """Activation of the parameter head (only the parameter prediction).
+class TelluricActivation(str, Enum):
+    """Output activation of the telluric head (only the spectrum prediction).
 
-    ``param_pred`` has shape ``(B, T, P)`` and holds ``P`` *heterogeneous*
-    physical parameters (pressure, humidity, airmass, molecular abundances,
-    ...). With min-max scaled targets (``data.scale_params``) every target lies
-    in ``[0, 1]``, so the head has to be bounded as well:
+    ``telluric_pred`` has shape ``(B, T, N)`` and holds the telluric
+    transmission of every exposure on the full wavelength grid. Transmission
+    is physical in ``[0, 1]`` and is never rescaled by the data pipeline:
 
-    * ``NONE`` -- linear head, for raw (physical-unit) targets;
-    * ``SIGMOID`` -- element-wise ``sigmoid``, i.e. every parameter is
-      independently constrained to ``(0, 1)``. This is the correct partner of
-      ``data.scale_params: true``.
-
-    A ``softmax`` is deliberately not offered: normalizing over ``P`` would
-    force pressure + humidity + airmass + ... to sum to 1 within one exposure,
-    and normalizing over ``T`` would force each parameter's exposures to sum to
-    1 over the night. Neither constraint holds for these parameters.
+    * ``OPTICAL_DEPTH`` -- ``T = exp(-softplus(z))``: the head predicts an
+      optical depth ``tau >= 0``, so ``T`` lies in ``(0, 1]``. Recommended.
+    * ``SIGMOID`` -- ``T = sigmoid(z)`` in ``(0, 1)``.
+    * ``NONE`` -- linear head (unbounded).
     """
 
-    NONE = "none"
+    OPTICAL_DEPTH = "optical_depth"
     SIGMOID = "sigmoid"
+    NONE = "none"
 
 
 class ModelConfig(BaseModel):
-    """Configuration for the whole-night telluric parameter estimator.
+    """Configuration for the whole-night telluric time-series estimator.
 
     No field carries a default: every value is a design or data decision and
     must be stated by the manifest (see ``experiments/``).  All fields are
-    consumed by :mod:`tellurics.models.predictor`; see that module's docstring for
+    consumed by :mod:`tellurics.models.multiple_frames.predictor`; see that module's docstring for
     the shape-annotated data flow.
     """
 
-    architecture: ModelArchitecture
+    single_frame: ClassVar[bool] = False
+
+    architecture: Literal[ModelArchitecture.NEURAL_TELLURIC_PREDICTOR]
 
     # -- problem dimensions (must match the DataModule contract) ---------- #
     num_wavelength_bins: int = Field(gt=0)
@@ -52,11 +71,6 @@ class ModelConfig(BaseModel):
         gt=0,
         description="Per-exposure metadata width P (data contract: 3 -> "
                     "pressure, temperature, humidity).",
-    )
-    param_dim: int = Field(
-        gt=0,
-        description="Number of telluric/atmospheric parameters per exposure "
-                    "(data contract: 16 = len(TARGET_COLUMNS)).",
     )
 
     # -- architecture geometry -------------------------------------------- #
@@ -106,15 +120,115 @@ class ModelConfig(BaseModel):
                     "concatenated with the spectral + metadata codes before "
                     "the temporal Perceiver.",
     )
-    param_decoder_hidden: int | None = Field(
+    telluric_decoder_hidden: int | None = Field(
         gt=0,
-        description="Hidden width of the per-exposure param-decoder MLP "
-                    "(None -> auto).",
+        description="Hidden width of the per-exposure telluric-decoder MLP "
+                    "(None -> 2 * spectral_latent_dim).",
     )
-    param_activation: ParamActivation = Field(
-        description="Activation applied to the parameter head output only "
-                    "(see ParamActivation). Use 'sigmoid' when "
-                    "data.scale_params maps the targets onto [0, 1]; the "
-                    "inverse transform back to physical units is "
-                    "tellurics.data.scaling.ParameterScaler.inverse_params.",
+    telluric_activation: TelluricActivation = Field(
+        description="Activation applied to the telluric head output only "
+                    "(see TelluricActivation). 'optical_depth' keeps the "
+                    "predicted transmission in (0, 1].",
     )
+
+
+# =========================================================================== #
+# Single-frame models:  observed (B, 1, N) -> flatten (B, N) -> telluric (B, 1, N)
+# =========================================================================== #
+class _SingleFrameConfig(BaseModel):
+    """Fields shared by every single-frame autoencoder.
+
+    Single-frame models see one exposure at a time: the observed spectrum
+    ``X = T_tell * S`` of shape ``(B, 1, N)`` is flattened to ``(B, N)`` and
+    mapped to the telluric transmission ``(B, 1, N)`` of that exposure.
+    """
+
+    single_frame: ClassVar[bool] = True
+
+    num_wavelength_bins: int = Field(gt=0, description="Spectral samples N.")
+    dropout: float = Field(ge=0.0, lt=1.0)
+    telluric_activation: TelluricActivation = Field(
+        description="Output activation of the telluric head "
+                    "(see TelluricActivation).",
+    )
+
+
+class CNNAutoencoderConfig(_SingleFrameConfig):
+    """Single-frame 1D-CNN autoencoder (:mod:`tellurics.models.single_frame.cnn_autoencoder`).
+
+    ``(B, N) -> strided Conv1d stack -> 1x1 squeeze -> flatten -> Linear
+    -> latent (B, latent_dim) -> Linear -> ConvTranspose1d stack -> (B, N)``.
+    """
+
+    architecture: Literal[ModelArchitecture.CNN_AUTOENCODER]
+    encoder_channels: list[int] = Field(
+        min_length=1, description="Channels of the strided encoder Conv1d stack; "
+                                  "the decoder mirrors them.",
+    )
+    kernel_size: int = Field(gt=0, description="Conv kernel (odd).")
+    stride: int = Field(gt=1, description="Down/up-sampling factor per layer.")
+    bottleneck_channels: int = Field(
+        gt=0, description="Channels kept by the 1x1 squeeze before flattening.",
+    )
+    latent_dim: int = Field(gt=0, description="Size of the latent code.")
+
+
+class TransformerAutoencoderConfig(_SingleFrameConfig):
+    """Single-frame transformer autoencoder (:mod:`tellurics.models.single_frame.transformer_autoencoder`).
+
+    ``(B, N) -> patches (B, n_patches, patch_size) -> Linear + pos-emb
+    -> TransformerEncoder -> cross-attention onto num_latents learned queries
+    (bottleneck: num_latents x latent_dim) -> TransformerDecoder from learned
+    per-patch queries -> Linear -> (B, N)``.
+    """
+
+    architecture: Literal[ModelArchitecture.TRANSFORMER_AUTOENCODER]
+    patch_size: int = Field(gt=0, description="Wavelength samples per token.")
+    d_model: int = Field(gt=0)
+    num_heads: int = Field(gt=0)
+    num_encoder_layers: int = Field(gt=0)
+    num_decoder_layers: int = Field(gt=0)
+    dim_feedforward: int = Field(gt=0)
+    num_latents: int = Field(gt=0, description="Learned bottleneck tokens.")
+    latent_dim: int = Field(gt=0, description="Width of each bottleneck token.")
+
+
+class SpecPTConfig(_SingleFrameConfig):
+    """SpecPT adapted to full-resolution single frames (:mod:`tellurics.models.single_frame.specpt`).
+
+    SpecPT conv stem (Conv1d k=41/21/11, stride 2, BatchNorm, ReLU, MaxPool)
+    -> strided token conv -> TransformerEncoder / TransformerDecoder (decoder
+    attends to the encoder output, as in SpecPT) -> per-token linear1/ReLU/
+    linear2 reconstruction of that token's wavelength window -> (B, N).
+    """
+
+    architecture: Literal[ModelArchitecture.SPECPT]
+    stem_channels: list[int] = Field(
+        min_length=1, description="SpecPT conv-stem channels (paper: 64, 128, 256).",
+    )
+    stem_kernels: list[int] = Field(
+        min_length=1, description="SpecPT conv-stem kernels (paper: 41, 21, 11).",
+    )
+    token_stride: int = Field(
+        gt=0, description="Extra downsampling of the stem output into tokens; "
+                          "each token covers 2**len(stem)*2*token_stride samples.",
+    )
+    d_model: int = Field(gt=0)
+    num_heads: int = Field(gt=0)
+    num_encoder_layers: int = Field(gt=0)
+    num_decoder_layers: int = Field(gt=0)
+    dim_feedforward: int = Field(gt=0)
+    head_hidden: int = Field(gt=0, description="Hidden width of linear1 in the "
+                                               "per-token reconstruction head.")
+
+
+AnyModelConfig = Annotated[
+    Union[
+        ModelConfig,
+        CNNAutoencoderConfig,
+        TransformerAutoencoderConfig,
+        SpecPTConfig,
+    ],
+    Field(discriminator="architecture"),
+]
+"""The ``model:`` section: the config class is chosen by ``architecture``."""

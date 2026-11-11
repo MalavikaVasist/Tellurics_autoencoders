@@ -1,40 +1,62 @@
 """Neural network architectures for telluric prediction.
 
+Layout::
+
+    models/
+    |-- output.py           ModelOutput            (shared)
+    |-- activations.py      telluric output activation (shared)
+    |-- multiple_frames/    whole-night model, (B, T, N) -> (B, T, N)
+    +-- single_frame/       single-exposure autoencoders, (B, 1, N) -> (B, 1, N)
+
 Importing this package executes the ``@ModelRegistry.register`` decorators of
-every architecture; the whole-night ``neural_telluric_predictor`` estimator is
-the one the training pipeline builds.
+every architecture; ``model.architecture`` in a manifest picks one of:
+
+* ``neural_telluric_predictor`` -- multiple frames (B, T, N) -> (B, T, N)
+* ``cnn_autoencoder``           -- single frame    (B, 1, N) -> (B, 1, N)
+* ``transformer_autoencoder``   -- single frame    (B, 1, N) -> (B, 1, N)
+* ``specpt``                    -- single frame    (B, 1, N) -> (B, 1, N)
 """
 
-from tellurics.models.decoders import ParamDecoder
-from tellurics.models.encoders import (
+from tellurics.models.activations import apply_telluric_activation, clear_sky_raw_value
+from tellurics.models.output import ModelOutput
+from tellurics.models.multiple_frames import (
+    FusionMLP,
     MetadataEncoder,
+    MultiHeadCrossAttention,
+    NeuralTelluricPredictor,
     SpectralEncoder,
     StellarEncoder,
-    TimeEncoder,
-)
-from tellurics.models.fusion import FusionMLP
-from tellurics.models.predictor import NeuralTelluricPredictor
-from tellurics.models.output import ModelOutput
-from tellurics.models.temporal import (
-    MultiHeadCrossAttention,
+    TelluricDecoder,
     TemporalDecoder,
     TemporalPerceiver,
+    TimeEncoder,
+)
+from tellurics.models.single_frame import (
+    CNNAutoencoder,
+    SingleFrameTelluricModel,
+    SpecPT,
+    TransformerAutoencoder,
 )
 
 __all__ = [
-    # Whole-night telluric parameter estimator (the trained architecture).
-    "NeuralTelluricPredictor",
+    # Shared.
     "ModelOutput",
-    # Per-exposure encoders (spectrum / stellar / metadata / time).
+    "apply_telluric_activation",
+    "clear_sky_raw_value",
+    # Multiple-frame (whole-night) model and its building blocks.
+    "NeuralTelluricPredictor",
     "SpectralEncoder",
     "StellarEncoder",
     "MetadataEncoder",
     "TimeEncoder",
-    # Temporal (exposure-axis) attention building blocks.
     "MultiHeadCrossAttention",
     "TemporalPerceiver",
     "TemporalDecoder",
-    # Fusion / decoder heads.
     "FusionMLP",
-    "ParamDecoder",
+    "TelluricDecoder",
+    # Single-frame autoencoders.
+    "SingleFrameTelluricModel",
+    "CNNAutoencoder",
+    "TransformerAutoencoder",
+    "SpecPT",
 ]

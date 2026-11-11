@@ -8,11 +8,11 @@ A full night of observations is a stack of ``T`` (= 73) exposures of ``N``
     X(t, l) = T_tell(t, l) * S(l)
 
 where ``S`` is the (night-constant) stellar spectrum and ``T_tell`` is the
-telluric transmission.  Instead of reconstructing the full ``N``-sample
-transmission, we regress the ``P`` telluric / atmospheric parameters that
-parametrize each exposure (e.g. via a TelFit-style forward model):
+telluric transmission.  The model reconstructs the full ``N``-sample
+telluric transmission of every exposure, i.e. the whole telluric time series
+of the night:
 
-    X: (B, T, N)  ->  param_pred: (B, T, P)   loss = MSE(param_input - param_pred)
+    X: (B, T, N)  ->  telluric_pred: (B, T, N)   loss = MSE(T_tell, telluric_pred)
 
 The two natural dimensions are exploited separately:
 
@@ -45,9 +45,10 @@ Architecture (shape-annotated)
         | TemporalDecoder (cross-attn, 73 learned exposure queries)
         v
     H_T (B, 73, 64)
-        | ParamDecoder (shared MLP, optional sigmoid head)
+        | TelluricDecoder (shared MLP + learned spectral basis,
+        |                  T = exp(-tau) head)
         v
-    param_pred (B, 73, 20)      loss = MSE(param_input, param_pred)
+    telluric_pred (B, 73, 51557)   loss = MSE(T_tell, telluric_pred)
 
 Notes
 -----
@@ -59,8 +60,9 @@ Notes
   the model only as small codes (``h_S`` = 64; metadata -> 16 dims;
   ``time_hours`` -> 16 dims via :class:`TimeEncoder`), concatenated with the
   spectral codes *before* the temporal Perceiver, so the fusion stays small.
-* Everything downstream of the per-exposure CNN codes is tiny; the parameter
-  count is dominated by the two spectral CNNs and the fusion MLP.
+* Everything between the per-exposure CNN codes and the telluric head is
+  tiny; the parameter count is dominated by the spectral CNNs, the fusion MLP
+  and the telluric decoder's spectral basis (hidden * N weights).
 * No batch size is hard-coded anywhere.
 
 First-implementation priorities
@@ -75,21 +77,22 @@ Example (tiny dims, shape check)
         architecture="neural_telluric_predictor",
         # problem dimensions (must match the data)
         num_wavelength_bins=1024, n_frames_per_series=12,
-        metadata_dim=3, param_dim=20,
+        metadata_dim=3,
         # architecture geometry
         num_queries=8, spectral_latent_dim=32, num_heads=4, dropout=0.1,
         x_encoder_channels=[8, 16, 32], x_encoder_kernel=7, x_encoder_stride=2,
         s_encoder_channels=[8, 16, 32], s_encoder_kernel=7, s_encoder_stride=2,
         encoder_pool_bins=16, fusion_hidden=0, fusion_layers=2,
         metadata_enc_dim=16, metadata_enc_hidden=None,
-        time_enc_dim=16, param_decoder_hidden=None,
+        time_enc_dim=16, telluric_decoder_hidden=None,
+        telluric_activation="optical_depth",
     )
     model = NeuralTelluricPredictor(cfg)
     out = model(torch.randn(2, 12, 1024),            # X = T*S
                 stellar=torch.randn(2, 1024),        # S (stellar)
                 metadata=torch.randn(2, 12, 3),      # per-exposure metadata
                 time=torch.rand(2, 12))              # exposure times (hours)
-    assert out.params.shape == (2, 12, 20)           # param_pred (B, T, P)
+    assert out.telluric.shape == (2, 12, 1024)       # telluric_pred (B, T, N)
 """
 
 from __future__ import annotations
@@ -102,7 +105,7 @@ from tellurics.config.model import ModelConfig
 from tellurics.models.output import ModelOutput
 from tellurics.utils.registry import ModelRegistry
 
-from .decoders import ParamDecoder
+from .decoders import TelluricDecoder
 from .encoders import MetadataEncoder, SpectralEncoder, StellarEncoder, TimeEncoder
 from .fusion import FusionMLP
 from .temporal import TemporalDecoder, TemporalPerceiver
@@ -115,7 +118,7 @@ __all__ = ["NeuralTelluricPredictor"]
 # --------------------------------------------------------------------------- #
 @ModelRegistry.register("neural_telluric_predictor")
 class NeuralTelluricPredictor(nn.Module):
-    """Whole-night telluric parameter estimator (CNN AE + Perceiver bottleneck).
+    """Whole-night telluric time-series estimator (CNN AE + Perceiver bottleneck).
 
     Inputs (all four are required; the ``None`` defaults on the signature are
     not handled by the forward pass):
@@ -129,11 +132,9 @@ class NeuralTelluricPredictor(nn.Module):
             the :class:`TimeEncoder` into the per-exposure time code.
 
     Output (ModelOutput):
-        params (B, T, P): predicted per-exposure telluric parameters param_pred.
-            When the head is bounded (``param_activation=sigmoid``, the partner
-            of ``data.scale_params``) these are *scaled* values in ``[0, 1]``;
-            map them back to physical units with
-            :meth:`tellurics.data.scaling.ParameterScaler.inverse_params`.
+        telluric (B, T, N): predicted telluric transmission of every exposure
+            on the full wavelength grid (telluric_pred). Physical
+            transmission, in ``(0, 1]`` with ``telluric_activation=optical_depth``.
         latent (B, Q*d): flattened Perceiver night summary h_X.
         attention_weights (B, Q, T): query -> exposure attention (mean over h).
         intermediate_features: dictionary with every intermediate tensor.
@@ -160,7 +161,6 @@ class NeuralTelluricPredictor(nn.Module):
         self.n_wavelength = n_w
         self.metadata_dim = p
         self.time_enc_dim = config.time_enc_dim
-        self.param_dim = config.param_dim
 
         c = config.metadata_enc_dim                     # metadata code width C
         k = config.time_enc_dim                         # time-code width k
@@ -207,12 +207,11 @@ class NeuralTelluricPredictor(nn.Module):
         self.temporal_decoder = TemporalDecoder(
             t, d, heads, config.dropout
         )
-        # 9. per-exposure parameter decoder: d-dim code -> P parameters
-        #    (``param_activation`` bounds only this head, e.g. sigmoid -> [0, 1]
-        #    for targets that ``data.scale_params`` put on [0, 1]).
-        self.param_decoder = ParamDecoder(
-            d, config.param_dim, config.param_decoder_hidden,
-            dropout=config.dropout, activation=config.param_activation,
+        # 9. per-exposure telluric decoder: d-dim code -> N-sample transmission
+        #    (``telluric_activation`` bounds only this head).
+        self.telluric_decoder = TelluricDecoder(
+            d, n_w, config.telluric_decoder_hidden,
+            dropout=config.dropout, activation=config.telluric_activation,
         )
 
         self._intermediate: dict[str, torch.Tensor] = {}
@@ -229,7 +228,7 @@ class NeuralTelluricPredictor(nn.Module):
             "StellarEncoder (S)": self.stellar_encoder,
             "FusionMLP": self.fusion,
             "TemporalDecoder": self.temporal_decoder,
-            "ParamDecoder": self.param_decoder,
+            "TelluricDecoder": self.telluric_decoder,
         }
         return {
             name: sum(p.numel() for p in m.parameters() if p.requires_grad)
@@ -248,7 +247,7 @@ class NeuralTelluricPredictor(nn.Module):
         metadata: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
     ) -> ModelOutput:
-        """Regress the whole-night telluric parameters.
+        """Predict the whole-night telluric transmission time series.
 
         Args:
             observed: (B, T, N) observed spectrum X = T_tell * S. T must equal
@@ -263,7 +262,7 @@ class NeuralTelluricPredictor(nn.Module):
                 ``None`` is not supported.
 
         Returns:
-            ModelOutput(params=(B, T, P), latent=(B, Q*d),
+            ModelOutput(telluric=(B, T, N), latent=(B, Q*d),
                         attention_weights=(B, Q, T),
                         intermediate_features={...}).
         """
@@ -346,11 +345,11 @@ class NeuralTelluricPredictor(nn.Module):
         h_t = self.temporal_decoder(latent)          # (B, T, d)
         assert h_t.shape == (batch, self.t, self.d), h_t.shape
 
-        # 9. shared per-exposure param decoder: d-code -> P parameters
-        param_pred = self.param_decoder(h_t)         # (B, T, P)
-        assert param_pred.shape == (
-            batch, self.t, self.param_dim,
-        ), param_pred.shape
+        # 9. shared per-exposure telluric decoder: d-code -> N-sample spectrum
+        telluric_pred = self.telluric_decoder(h_t)   # (B, T, N)
+        assert telluric_pred.shape == (
+            batch, self.t, self.n_wavelength,
+        ), telluric_pred.shape
 
         attn = attn_heads.mean(dim=1)                # (B, Q, T) mean over heads
 
@@ -366,10 +365,10 @@ class NeuralTelluricPredictor(nn.Module):
             "h_fused": h_fused,          # (B, q*d)
             "latent": latent,            # (B, Q, d)
             "temporal": h_t,             # (B, T, d)
-            "param_pred": param_pred,    # (B, T, P)
+            "telluric_pred": telluric_pred,  # (B, T, N)
         }
         return ModelOutput(
-            params=param_pred,
+            telluric=telluric_pred,
             latent=h_x,
             attention_weights=attn,
             intermediate_features=self._intermediate,

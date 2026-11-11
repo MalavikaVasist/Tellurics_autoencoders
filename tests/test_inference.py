@@ -3,7 +3,7 @@
 import torch
 
 from tellurics.config.model import ModelArchitecture, ModelConfig
-from tellurics.models.predictor import NeuralTelluricPredictor
+from tellurics.models.multiple_frames.predictor import NeuralTelluricPredictor
 from tellurics.models.output import ModelOutput
 
 
@@ -14,7 +14,6 @@ def _tiny_config() -> ModelConfig:
         num_wavelength_bins=256,
         n_frames_per_series=6,
         metadata_dim=3,
-        param_dim=20,
         num_queries=4,
         spectral_latent_dim=16,
         num_heads=4,
@@ -31,8 +30,8 @@ def _tiny_config() -> ModelConfig:
         metadata_enc_dim=16,
         metadata_enc_hidden=None,
         time_enc_dim=16,
-        param_decoder_hidden=None,
-        param_activation="sigmoid",
+        telluric_decoder_hidden=None,
+        telluric_activation="optical_depth",
     )
 
 
@@ -62,8 +61,8 @@ class TestEstimatorInference:
             second = model(x, stellar=s, metadata=metadata, time=time)
 
         assert isinstance(first, ModelOutput)
-        assert first.params.shape == (2, 6, 20)
-        assert torch.equal(first.params, second.params)
+        assert first.telluric.shape == (2, 6, 256)
+        assert torch.equal(first.telluric, second.telluric)
 
     def test_mc_dropout_varies_predictions(self) -> None:
         """Dropout must be active in train() so MC sampling is meaningful."""
@@ -71,10 +70,10 @@ class TestEstimatorInference:
         x, s, metadata, time = _batch()
 
         with torch.no_grad():
-            first = model(x, stellar=s, metadata=metadata, time=time).params
-            second = model(x, stellar=s, metadata=metadata, time=time).params
+            first = model(x, stellar=s, metadata=metadata, time=time).telluric
+            second = model(x, stellar=s, metadata=metadata, time=time).telluric
 
-        assert first.shape == (2, 6, 20)
+        assert first.shape == (2, 6, 256)
         assert not torch.equal(first, second)
 
     def test_planet_recovery_computation(self) -> None:

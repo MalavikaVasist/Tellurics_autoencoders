@@ -1,4 +1,4 @@
-"""Tests for the whole-night telluric parameter estimator (NeuralTelluricPredictor)."""
+"""Tests for the whole-night telluric time-series estimator (NeuralTelluricPredictor)."""
 
 import os
 
@@ -6,9 +6,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tellurics.config.model import ModelConfig, ParamActivation
-from tellurics.models.decoders import ParamDecoder
-from tellurics.models.predictor import NeuralTelluricPredictor
+from tellurics.config.model import ModelConfig, TelluricActivation
+from tellurics.models.multiple_frames.decoders import TelluricDecoder
+from tellurics.models.multiple_frames.predictor import NeuralTelluricPredictor
 from tellurics.models.output import ModelOutput
 from tellurics.utils.registry import ModelRegistry
 
@@ -20,7 +20,7 @@ def _config(
     d: int = 32,
     metadata_dim: int = 3,
     heads: int = 4,
-    param_activation: str = "sigmoid",
+    telluric_activation: str = "optical_depth",
 ) -> ModelConfig:
     """Small dims so the tests stay fast on CPU (a repo-wide ModelConfig).
 
@@ -31,7 +31,6 @@ def _config(
         num_wavelength_bins=n_wave,
         n_frames_per_series=t,
         metadata_dim=metadata_dim,
-        param_dim=16,
         num_queries=q,
         spectral_latent_dim=d,
         num_heads=heads,
@@ -48,8 +47,8 @@ def _config(
         metadata_enc_dim=16,
         metadata_enc_hidden=None,
         time_enc_dim=16,
-        param_decoder_hidden=None,
-        param_activation=param_activation,
+        telluric_decoder_hidden=None,
+        telluric_activation=telluric_activation,
     )
 
 
@@ -66,8 +65,10 @@ class TestNeuralTelluricPredictorShapes:
         out = model(observed, stellar=stellar, metadata=metadata, time=time)
 
         assert isinstance(out, ModelOutput)
-        assert out.params is not None
-        assert out.params.shape == (2, cfg.n_frames_per_series, cfg.param_dim)
+        assert out.telluric is not None
+        assert out.telluric.shape == (
+            2, cfg.n_frames_per_series, cfg.num_wavelength_bins,
+        )
         assert out.latent.shape == (2, cfg.num_queries * cfg.spectral_latent_dim)
         assert out.attention_weights.shape == (
             2, cfg.num_queries, cfg.n_frames_per_series,
@@ -108,8 +109,8 @@ class TestNeuralTelluricPredictorShapes:
         assert feats["temporal"].shape == (
             2, cfg.n_frames_per_series, cfg.spectral_latent_dim,
         )
-        assert feats["param_pred"].shape == (
-            2, cfg.n_frames_per_series, cfg.param_dim,
+        assert feats["telluric_pred"].shape == (
+            2, cfg.n_frames_per_series, cfg.num_wavelength_bins,
         )
 
     def test_missing_inputs_raise(self) -> None:
@@ -156,7 +157,7 @@ class TestNeuralTelluricPredictorShapes:
                 metadata=torch.randn(batch, 12, cfg.metadata_dim),
                 time=torch.rand(batch, 12),
             )
-            assert out.params.shape == (batch, 12, cfg.param_dim)
+            assert out.telluric.shape == (batch, 12, cfg.num_wavelength_bins)
 
     @pytest.mark.skipif(
         os.environ.get("TELLURIC_SLOW_TESTS") != "1",
@@ -174,7 +175,7 @@ class TestNeuralTelluricPredictorShapes:
             metadata=torch.randn(batch, 73, 3),
             time=torch.rand(batch, 73),
         )
-        assert out.params.shape == (batch, 73, cfg.param_dim)
+        assert out.telluric.shape == (batch, 73, 51556)
         assert out.latent.shape == (batch, 1024)
         assert out.attention_weights.shape == (batch, 16, 73)
 
@@ -189,11 +190,11 @@ class TestGradientFlow:
         stellar = torch.randn(2, 1024)
         metadata = torch.randn(2, 12, cfg.metadata_dim)
         hours = torch.rand(2, 12)                   # exposure times
-        target = torch.randn(2, 12, cfg.param_dim)  # random param target
+        target = torch.rand(2, 12, cfg.num_wavelength_bins)  # random transmission
 
         opt.zero_grad()
         out = model(observed, stellar=stellar, metadata=metadata, time=hours)
-        loss = F.mse_loss(out.params, target)
+        loss = F.mse_loss(out.telluric, target)
         loss.backward()
         opt.step()
 
@@ -209,7 +210,7 @@ class TestGradientFlow:
         assert set(counts) == {
             "SpectralEncoder (X)", "MetadataEncoder", "TimeEncoder",
             "PreTemporal", "TemporalPerceiver", "StellarEncoder (S)",
-            "FusionMLP", "TemporalDecoder", "ParamDecoder",
+            "FusionMLP", "TemporalDecoder", "TelluricDecoder",
         }
         assert all(v > 0 for v in counts.values())
         assert sum(counts.values()) == model.count_parameters()
@@ -240,33 +241,32 @@ def _synthetic_night(n_wave: int, n_frames: int, rng: torch.Generator):
 
 
 class TestOverfitTiny:
-    def test_fits_a_tiny_param_regression(self) -> None:
-        """The estimator must reduce MSE(param_input, param_pred) on a tiny set."""
+    def test_fits_a_tiny_telluric_reconstruction(self) -> None:
+        """The estimator must reduce MSE(T_tell, telluric_pred) on a tiny set."""
         cfg = _config(n_wave=512, t=12, q=8, d=32, heads=4)
         model = NeuralTelluricPredictor(cfg)
         opt = torch.optim.Adam(model.parameters(), lr=5e-3)
 
         nights = 4
-        xs, ss, metas = [], [], []
+        xs, ss, tells, metas = [], [], [], []
         g = torch.Generator().manual_seed(0)
         for _ in range(nights):
-            x, s, _, meta = _synthetic_night(
+            x, s, tell, meta = _synthetic_night(
                 cfg.num_wavelength_bins, cfg.n_frames_per_series, g
             )
-            xs.append(x); ss.append(s.squeeze(0)); metas.append(meta)
+            xs.append(x); ss.append(s.squeeze(0)); tells.append(tell)
+            metas.append(meta)
         x = torch.stack(xs)               # (B, T, N)
         s = torch.stack(ss)               # (B, N)
         metadata = torch.stack(metas)     # (B, T, P) per-exposure metadata
-        # Targets live in [0, 1]: that is the space the sigmoid head (and
-        # ``data.scale_params``) operate in.
-        param_input = torch.rand(nights, cfg.n_frames_per_series, cfg.param_dim)
+        telluric = torch.stack(tells)     # (B, T, N) true transmission
         hours = torch.rand(nights, cfg.n_frames_per_series)
 
         losses = []
         for _ in range(120):
             opt.zero_grad()
             out = model(x, stellar=s, metadata=metadata, time=hours)
-            loss = F.mse_loss(out.params, param_input)
+            loss = F.mse_loss(out.telluric, telluric)
             loss.backward()
             opt.step()
             losses.append(loss.item())
@@ -274,12 +274,13 @@ class TestOverfitTiny:
         assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
 
 
-class TestParamActivation:
-    """The parameter head is the only bounded output of the model."""
+class TestTelluricActivation:
+    """The telluric head is the only bounded output of the model."""
 
-    def test_sigmoid_head_stays_within_the_unit_interval(self) -> None:
-        """Even with saturating inputs, the predicted params stay in [0, 1]."""
-        cfg = _config(param_activation="sigmoid")
+    @pytest.mark.parametrize("activation", ["optical_depth", "sigmoid"])
+    def test_bounded_heads_stay_within_the_unit_interval(self, activation) -> None:
+        """Even with saturating inputs, the predicted transmission is in [0, 1]."""
+        cfg = _config(telluric_activation=activation)
         model = NeuralTelluricPredictor(cfg).eval()
         with torch.no_grad():
             out = model(
@@ -288,23 +289,37 @@ class TestParamActivation:
                 metadata=torch.randn(2, 12, cfg.metadata_dim) * 25.0,
                 time=torch.rand(2, 12) * 25.0,
             )
-        assert float(out.params.min()) >= 0.0
-        assert float(out.params.max()) <= 1.0
+        assert float(out.telluric.min()) >= 0.0
+        assert float(out.telluric.max()) <= 1.0
 
     def test_head_matches_the_documented_transform(self) -> None:
-        """sigmoid(raw) for the sigmoid head, raw for the linear one."""
+        """exp(-softplus(raw)), sigmoid(raw) or raw, depending on the head."""
         code = torch.randn(3, 8)
-        sigmoid_head = ParamDecoder(8, 4, activation="sigmoid")
-        linear_head = ParamDecoder(8, 4, activation="none")
-        assert torch.allclose(
-            sigmoid_head(code), torch.sigmoid(sigmoid_head.net(code))
-        )
-        assert torch.allclose(linear_head(code), linear_head.net(code))
-        assert bool(((sigmoid_head(code) > 0) & (sigmoid_head(code) < 1)).all())
+        tau_head = TelluricDecoder(8, 64, activation="optical_depth")
+        sigmoid_head = TelluricDecoder(8, 64, activation="sigmoid")
+        linear_head = TelluricDecoder(8, 64, activation="none")
 
-    def test_default_head_is_linear(self) -> None:
-        """Backward compatibility: unchanged unless an activation is asked for."""
-        assert ParamDecoder(8, 4).activation is ParamActivation.NONE
+        def raw(head):
+            return head.basis(head.mlp(code))
+
+        assert torch.allclose(tau_head(code), torch.exp(-F.softplus(raw(tau_head))))
+        assert torch.allclose(sigmoid_head(code), torch.sigmoid(raw(sigmoid_head)))
+        assert torch.allclose(linear_head(code), raw(linear_head))
+        assert bool(((tau_head(code) > 0) & (tau_head(code) <= 1)).all())
+
+    def test_default_head_is_optical_depth(self) -> None:
+        assert TelluricDecoder(8, 64).activation is TelluricActivation.OPTICAL_DEPTH
+
+    def test_any_leading_dims(self) -> None:
+        head = TelluricDecoder(8, 64)
+        assert head(torch.randn(2, 5, 8)).shape == (2, 5, 64)
+        assert head(torch.randn(7, 8)).shape == (7, 64)
+
+    def test_initial_prediction_is_near_transparent(self) -> None:
+        """Bounded heads start near T ~ 1 (a clear sky), not at T = 0.5."""
+        for activation in ("optical_depth", "sigmoid"):
+            head = TelluricDecoder(8, 64, activation=activation)
+            assert float(head(torch.zeros(1, 8)).mean()) > 0.9
 
 
 def _repo_model_config(n_wave: int = 1024, t: int = 12) -> "ModelConfig":
@@ -328,7 +343,7 @@ class TestRepoIntegration:
             metadata=torch.randn(2, 12, 3),
             time=torch.rand(2, 12),
         )
-        assert out.params.shape == (2, 12, cfg.param_dim)
+        assert out.telluric.shape == (2, 12, cfg.num_wavelength_bins)
 
 
 class TestNightLevelSplit:

@@ -1,9 +1,9 @@
-# Experiment 1: whole-night telluric *parameter* regression with
+# Experiment 1: whole-night telluric *time-series* reconstruction with
 #
-#   X = T*S  (B, T=73, N=51557)        ->  param_pred (B, T, 16)
-#   metadata (B, T, 3)  per exposure        loss = MSE(param_input - param_pred)
+#   X = T*S  (B, T=73, N=51557)        ->  telluric_pred (B, T, N=51557)
+#   metadata (B, T, 3)  per exposure        loss = MSE(T_tell, telluric_pred)
 #
-# Pipeline (tellurics.models.predictor.NeuralTelluricPredictor, registry id
+# Pipeline (tellurics.models.multiple_frames.predictor.NeuralTelluricPredictor, registry id
 # "neural_telluric_predictor"):
 #   1. shared 1D-CNN encodes each exposure of X       ->  Z (B, 73, 64)
 #   2. MetadataEncoder maps per-exposure metadata to a 16-dim code
@@ -11,14 +11,15 @@
 #      both concatenated with Z (pre_temporal -> d)   ->  tokens (B, 73, 64)
 #   3. the temporal Perceiver compresses the 73 exposures into Q=16 latent
 #   4. the latent is expanded back to per-exposure codes H_T (B, 73, 64)
-#   5. a shared MLP (ParamDecoder) decodes each code to 16 parameters
+#   5. a shared TelluricDecoder (MLP + learned spectral basis) decodes each
+#      code to the full 51557-sample telluric transmission
 #
 # Run:
-#   python -m tellurics.scripts.train --config experiments/experiment1.yaml
+#   python -m tellurics.scripts.train --config experiments/experiment.yaml
 #
 # Contract with tellurics.data.datamodule (must not be changed blindly):
-#   metadata_dim == 3    # pressure, temperature, humidity (per exposure)
-#   param_dim    == 16   # TARGET_COLUMNS = PHYSICAL_COLUMNS - {"time_hours"}
+#   metadata_dim        == 3       # pressure, temperature, humidity (per exposure)
+#   num_wavelength_bins == 51557   # = transmission.shape[-1] in the night HDF5
 
 # Artefacts (config.yaml, stellar_assignment.csv, logs/, checkpoints/) land here.
 run_dir: runs/experiment
@@ -39,9 +40,8 @@ model:
   metadata_enc_dim: 16                   # encoded metadata code width C
   metadata_enc_hidden: null              # metadata MLP hidden (null -> auto)
   time_enc_dim: 16                       # width of the per-exposure time code
-  param_dim: 16                          # regressed telluric params per exposure P'
-  param_decoder_hidden: null             # param-decoder MLP hidden (null -> auto)
-  param_activation: sigmoid              # bound the parameter head to (0,1); partner of data.scale_params
+  telluric_decoder_hidden: null          # telluric-decoder MLP hidden (null -> 2*d)
+  telluric_activation: optical_depth     # T = exp(-softplus(z)) in (0, 1]  (optical_depth | sigmoid | none)
   num_heads: 4                           # number of attention heads in the temporal Perceiver
   dropout: 0.1
   # shared strided 1D-CNN over the 73 exposures of X (one CNN, shared weights)
@@ -67,7 +67,7 @@ data:
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
   scale_metadata: true                   # metadata  (pressure, temperature, humidity) -> [0,1]
-  scale_params: true                     # targets   (TARGET_COLUMNS) -> [0,1]; needs param_activation: sigmoid
+  scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
   scale_time: true                       # time_hours -> [0,1]  (time_hours / 16)
   param_bounds:
     time_hours: [0.0, 6.0]              # h    

@@ -8,7 +8,7 @@ from tellurics.config.parameters import (
     TIME_COLUMN,
 )
 from tellurics.config.data import DataConfig
-from tellurics.config.model import ModelArchitecture, ModelConfig, ParamActivation
+from tellurics.config.model import ModelArchitecture, ModelConfig, TelluricActivation
 from tellurics.config.training import TrainingConfig
 from tests._bounds import BOUNDS
 
@@ -18,7 +18,6 @@ MODEL_KWARGS = {
     "num_wavelength_bins": 1024,
     "n_frames_per_series": 12,
     "metadata_dim": 3,
-    "param_dim": 16,
     "num_queries": 8,
     "spectral_latent_dim": 32,
     "num_heads": 4,
@@ -35,8 +34,8 @@ MODEL_KWARGS = {
     "metadata_enc_dim": 16,
     "metadata_enc_hidden": None,
     "time_enc_dim": 16,
-    "param_decoder_hidden": None,
-    "param_activation": "sigmoid",
+    "telluric_decoder_hidden": None,
+    "telluric_activation": "optical_depth",
 }
 
 
@@ -47,7 +46,6 @@ class TestModelConfig:
             config.architecture is ModelArchitecture.NEURAL_TELLURIC_PREDICTOR
         )
         assert config.n_frames_per_series == 12
-        assert config.param_dim == 16
 
     @pytest.mark.parametrize("field", sorted(MODEL_KWARGS))
     def test_no_field_has_a_default(self, field: str) -> None:
@@ -65,23 +63,29 @@ class TestModelConfig:
             ModelConfig(**{**MODEL_KWARGS, "metadata_dim": 0})
 
     def test_data_contract_dimensions(self) -> None:
-        """The three dims that must agree with the DataModule."""
+        """The dims that must agree with the DataModule."""
         config = ModelConfig(**MODEL_KWARGS)
         assert config.metadata_dim == 3   # pressure, temperature, humidity
-        assert config.param_dim == 16     # TARGET_COLUMNS
         assert config.num_wavelength_bins == 1024
 
-    def test_param_activation_is_parsed(self) -> None:
-        assert ModelConfig(**MODEL_KWARGS).param_activation is ParamActivation.SIGMOID
+    def test_telluric_activation_is_parsed(self) -> None:
         assert (
-            ModelConfig(**{**MODEL_KWARGS, "param_activation": "none"})
-            .param_activation
-            is ParamActivation.NONE
+            ModelConfig(**MODEL_KWARGS).telluric_activation
+            is TelluricActivation.OPTICAL_DEPTH
         )
+        for value, member in (
+            ("sigmoid", TelluricActivation.SIGMOID),
+            ("none", TelluricActivation.NONE),
+        ):
+            assert (
+                ModelConfig(**{**MODEL_KWARGS, "telluric_activation": value})
+                .telluric_activation
+                is member
+            )
 
     def test_rejects_unknown_activation(self) -> None:
         with pytest.raises(ValueError):
-            ModelConfig(**{**MODEL_KWARGS, "param_activation": "softmax"})
+            ModelConfig(**{**MODEL_KWARGS, "telluric_activation": "softmax"})
 
 
 class TestDataConfigScaling:

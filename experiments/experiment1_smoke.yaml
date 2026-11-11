@@ -32,9 +32,8 @@ model:
   metadata_enc_dim: 16                   # encoded metadata code width C
   metadata_enc_hidden: null              # metadata MLP hidden (null -> auto)
   time_enc_dim: 16                       # width of the per-exposure time code
-  param_dim: 16                          # regressed telluric params per exposure P'
-  param_decoder_hidden: null             # param-decoder MLP hidden (null -> auto)
-  param_activation: sigmoid              # bound the parameter head to (0,1); partner of data.scale_params
+  telluric_decoder_hidden: null          # telluric-decoder MLP hidden (null -> 2*d)
+  telluric_activation: optical_depth     # T = exp(-softplus(z)) in (0, 1]  (optical_depth | sigmoid | none)
   num_heads: 4
   dropout: 0.1
   # shared strided 1D-CNN over the 73 exposures of X (one CNN, shared weights)
@@ -56,7 +55,7 @@ data:
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   scale_metadata: true                   # metadata -> [0,1]
-  scale_params: true                     # targets  -> [0,1] (pairs with param_activation: sigmoid)
+  scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
   scale_time: true                       # time_hours / 16 -> [0,1]
   param_bounds:
     time_hours: [0.0, 6.0]               # h    

@@ -9,14 +9,26 @@ from tellurics.config.parameters import (
 )
 from tellurics.config.data import DataConfig
 from tellurics.config.experiment import ExperimentConfig, load_config
-from tellurics.config.model import ModelArchitecture, ModelConfig, ParamActivation
+from tellurics.config.model import (
+    AnyModelConfig,
+    CNNAutoencoderConfig,
+    ModelArchitecture,
+    ModelConfig,
+    SpecPTConfig,
+    TelluricActivation,
+    TransformerAutoencoderConfig,
+)
 from tellurics.config.training import OptimizerConfig, SchedulerConfig, TrainingConfig
 from tellurics.config.wandb import WandbConfig
 
 __all__ = [
     "ModelConfig",
+    "AnyModelConfig",
+    "CNNAutoencoderConfig",
+    "TransformerAutoencoderConfig",
+    "SpecPTConfig",
     "ModelArchitecture",
-    "ParamActivation",
+    "TelluricActivation",
     "DataConfig",
     "Parameters",
     "ExperimentConfig",

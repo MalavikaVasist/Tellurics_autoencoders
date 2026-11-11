@@ -14,12 +14,12 @@ Shared modules used by the whole-night telluric models to compress the
   ``T`` learned exposure queries.
 """
 
-from tellurics.models.temporal.attention import (
+from tellurics.models.multiple_frames.temporal.attention import (
     MultiHeadCrossAttention,
     _CrossAttentionBlock,
 )
-from tellurics.models.temporal.decoder import TemporalDecoder
-from tellurics.models.temporal.perceiver import TemporalPerceiver
+from tellurics.models.multiple_frames.temporal.decoder import TemporalDecoder
+from tellurics.models.multiple_frames.temporal.perceiver import TemporalPerceiver
 
 __all__ = [
     "MultiHeadCrossAttention",

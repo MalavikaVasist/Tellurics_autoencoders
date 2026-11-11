@@ -1,7 +1,7 @@
 """Fusion modules for the whole-night telluric estimator.
 
 :class:`FusionMLP` fuses the flattened Perceiver night summary with the compact
-stellar code (see :mod:`tellurics.models.predictor`).
+stellar code (see :mod:`tellurics.models.multiple_frames.predictor`).
 """
 
 import torch

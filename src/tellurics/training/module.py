@@ -1,7 +1,9 @@
 """PyTorch Lightning module for training the whole-night telluric predictor.
 
-The model predicts telluric parameters for each exposure in a night.
-Training uses MSE between the predicted and target parameters.
+The model predicts the full telluric transmission spectrum of every exposure
+in the sample -- a whole night (T exposures) or a single exposure (T = 1, for
+the single-frame models). Training uses MSE between the predicted and true
+transmission.
 
 Inputs:
     observed: (B, T, N) observed spectra.
@@ -10,23 +12,20 @@ Inputs:
     time: (B, T) exposure times.
 
 The model predicts:
-    params: (B, T, P) telluric parameters.
+    telluric: (B, T, N) telluric transmission time series.
 
-When parameter scaling is enabled, targets and predictions are in [0, 1].
-Use ``predict_physical()`` to convert predictions back to physical units.
+Target: ``batch["telluric"]`` (B, T, N), the noiseless transmission used to
+build ``observed``. Transmission is physical (in [0, 1]) and never rescaled.
 """
 
 from __future__ import annotations
-
-from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
-from tellurics.config.model import ModelConfig
+from tellurics.config.model import AnyModelConfig
 from tellurics.config.training import OptimizerType, SchedulerType, TrainingConfig
-from tellurics.data.scaling import ParameterScaler
 from tellurics.models.output import ModelOutput
 from tellurics.utils.logging import get_logger
 from tellurics.utils.registry import ModelRegistry
@@ -36,32 +35,28 @@ logger = get_logger(__name__)
 
 
 class TelluricTrainingModule(pl.LightningModule):
-    """Train the whole-night telluric parameter predictor.
+    """Train the whole-night telluric time-series predictor.
 
-    Uses MSE between predicted and target telluric parameters.
+    Uses MSE between predicted and true telluric transmission spectra.
     Also configures the optimizer and learning-rate scheduler.
     """
 
     def __init__(
         self,
-        model_config: ModelConfig,
+        model_config: AnyModelConfig,
         training_config: TrainingConfig,
-        scaler: ParameterScaler | None = None,
     ) -> None:
         """Initialize the training module.
 
         Args:
             model_config: Model architecture configuration.
             training_config: Optimizer, scheduler, and training settings.
-            scaler: Optional parameter scaler used to convert predictions
-                back to physical units.
         """
         super().__init__()
-        self.save_hyperparameters(ignore=["scaler"])
+        self.save_hyperparameters()
 
         self.model_config = model_config
         self.training_config = training_config
-        self.scaler = scaler
 
         model_cls = ModelRegistry.get(model_config.architecture.value)
         self.model = model_cls(model_config)
@@ -88,7 +83,7 @@ class TelluricTrainingModule(pl.LightningModule):
             time: Exposure times with shape (B, T).
 
         Returns:
-            ModelOutput containing predicted parameters with shape (B, T, P).
+            ModelOutput containing the predicted telluric time series (B, T, N).
         """
         return self.model(
             observed, stellar=stellar, metadata=metadata, time=time
@@ -109,10 +104,10 @@ class TelluricTrainingModule(pl.LightningModule):
     ) -> torch.Tensor:
         """Run one training, validation, or test step.
 
-        The loss is MSE between predicted and target parameters.
+        The loss is MSE between predicted and true telluric transmission.
         """
-        pred = self._run_estimator(batch).params                 # (B, T, P)
-        target = batch["theta"]["output_params"]                 # (B, T, P)
+        pred = self._run_estimator(batch).telluric               # (B, T, N)
+        target = batch["telluric"]                               # (B, T, N)
         loss = F.mse_loss(pred, target)
         rmse = loss.sqrt()
         is_train = stage == "train"
@@ -177,35 +172,10 @@ class TelluricTrainingModule(pl.LightningModule):
     ) -> ModelOutput:
         """Run the model on a batch without calculating loss.
 
-        Returns predictions in the same normalized space used during training.
-        Use ``predict_physical()`` to convert parameters to physical units.
+        Returns the predicted telluric time series ``(B, T, N)``, already
+        in physical transmission units.
         """
         return self._run_estimator(batch)
-
-    # ------------------------------------------------------------------ #
-    def predict_physical(
-        self, batch: dict[str, torch.Tensor]
-    ) -> ModelOutput:
-        """Predict parameters and convert them to physical units.
-
-        Returns:
-            ModelOutput with parameters converted from normalized values
-            to physical units.
-        """
-        return self.to_physical(self._run_estimator(batch))
-
-    def to_physical(self, output: ModelOutput) -> ModelOutput:
-        """Convert an existing ModelOutput from normalized to physical units.
-
-        Returns the output unchanged when no parameter scaling is enabled.
-        """
-        if self.scaler is None or output.params is None:
-            return output
-        if not self.scaler.scale_params:
-            return output
-        return replace(
-            output, params=self.scaler.inverse_params_torch(output.params)
-        )
 
     # ------------------------------------------------------------------ #
     def configure_optimizers(self) -> dict:

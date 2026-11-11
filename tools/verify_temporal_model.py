@@ -34,7 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from tellurics.config.model import ModelConfig
-from tellurics.models.predictor import NeuralTelluricPredictor as TelluricModel
+from tellurics.models.multiple_frames.predictor import NeuralTelluricPredictor as TelluricModel
 
 
 def _tiny_config(
@@ -52,7 +52,6 @@ def _tiny_config(
         num_wavelength_bins=n_wavelength,
         n_frames_per_series=n_frames,
         metadata_dim=metadata_dim,
-        param_dim=20,
         num_queries=n_queries,
         spectral_latent_dim=latent_dim,
         num_heads=n_heads,
@@ -69,10 +68,8 @@ def _tiny_config(
         metadata_enc_dim=16,
         metadata_enc_hidden=None,
         time_enc_dim=16,
-        param_decoder_hidden=None,
-        # This demo regresses toward raw, unbounded random targets, so the head
-        # stays linear ("sigmoid" is the partner of data.scale_params=true).
-        param_activation="none",
+        telluric_decoder_hidden=None,
+        telluric_activation="optical_depth",   # T = exp(-tau) in (0, 1]
     )
 
 
@@ -198,7 +195,7 @@ def run_shape_check(args: argparse.Namespace) -> None:
         "h_fused": out.intermediate_features["h_fused"].shape,
         "latent": out.intermediate_features["latent"].shape,
         "temporal": out.intermediate_features["temporal"].shape,
-        "param_pred (params)": out.intermediate_features["param_pred"].shape,
+        "telluric_pred": out.intermediate_features["telluric_pred"].shape,
         "attention (Q->T)": out.attention_weights.shape,
     }
     for name, shp in shapes.items():
@@ -222,7 +219,7 @@ def run_shape_check(args: argparse.Namespace) -> None:
         "h_fused": (batch, cfg.num_queries * cfg.spectral_latent_dim),
         "latent": (batch, cfg.num_queries, cfg.spectral_latent_dim),
         "temporal": (batch, cfg.n_frames_per_series, cfg.spectral_latent_dim),
-        "param_pred (params)": (batch, cfg.n_frames_per_series, cfg.param_dim),
+        "telluric_pred": (batch, cfg.n_frames_per_series, cfg.num_wavelength_bins),
         "attention (Q->T)": (batch, cfg.num_queries, cfg.n_frames_per_series),
     }
     bad = {k: (v, expected[k]) for k, v in shapes.items() if tuple(v) != expected[k]}
@@ -252,18 +249,14 @@ def run_overfit(args: argparse.Namespace) -> None:
           f"T={cfg.n_frames_per_series}, "
           f"Q={cfg.num_queries}, d={cfg.spectral_latent_dim} =====")
 
-    x, s, _, meta = make_synthetic_nights(
+    x, s, tell, meta = make_synthetic_nights(
         args.nights, cfg.num_wavelength_bins, cfg.n_frames_per_series,
         seed=args.seed,
     )
     hours = torch.rand(args.nights, cfg.n_frames_per_series)  # exposure times
     print(f"  train set: {x.shape[0]} nights x {x.shape[1]} exposures "
           f"x {x.shape[2]} samples")
-    # Model-level demo only: regress param_pred (B, T, P) toward a fixed
-    # random param_input target.  A physically-consistent params->transmission
-    # generator belongs to the training/data wiring (handled separately).
-    torch.manual_seed(args.seed)
-    param_input = torch.randn(args.nights, cfg.n_frames_per_series, cfg.param_dim)
+    # Reconstruct the true synthetic telluric time series T (B, T, N).
 
     opt = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -272,7 +265,7 @@ def run_overfit(args: argparse.Namespace) -> None:
     def step() -> float:
         opt.zero_grad()
         out = model(x, stellar=s, metadata=meta, time=hours)
-        loss = F.mse_loss(out.params, param_input)
+        loss = F.mse_loss(out.telluric, tell)
         loss.backward()
         opt.step()
         return loss.item()
@@ -284,7 +277,7 @@ def run_overfit(args: argparse.Namespace) -> None:
         losses.append(l)
         if it == 1 or it % args.log_every == 0 or it == args.steps:
             print(f"  step {it:>4}/{args.steps}   "
-                  f"MSE(param_input, param_pred)={l:.3e}")
+                  f"MSE(T_tell, telluric_pred)={l:.3e}")
 
     dt = time.time() - t0
     print(f"\n  train MSE  {losses[0]:.3e} -> {losses[-1]:.3e}   "
@@ -296,8 +289,8 @@ def run_overfit(args: argparse.Namespace) -> None:
     # quick gradient sanity on a random batch
     xb = x[:2]
     loss = F.mse_loss(
-        model(xb, stellar=s[:2], metadata=meta[:2], time=hours[:2]).params,
-        param_input[:2],
+        model(xb, stellar=s[:2], metadata=meta[:2], time=hours[:2]).telluric,
+        tell[:2],
     )
     loss.backward()
     missing = sum(1 for p in model.parameters() if p.requires_grad and p.grad is None)

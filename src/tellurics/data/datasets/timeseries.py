@@ -2,7 +2,7 @@
 
 Reads the night-major HDF5 built once by ``tests/testing_dataset_reshape.ipynb``
 (``transmission`` / ``labels`` / ``wavelength``) and turns each night into the
-inputs the :class:`~tellurics.models.predictor.NeuralTelluricPredictor` consumes.
+inputs the :class:`~tellurics.models.multiple_frames.predictor.NeuralTelluricPredictor` consumes.
 
 When a :class:`~tellurics.data.scaling.ParameterScaler` is supplied, the
 per-exposure metadata, the target parameters and ``time_hours`` are mapped onto
@@ -77,15 +77,18 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
     Returns a dict with:
         observed:   (T, N)   X = T_tell * S
         stellar:    (N,)     the S used to build observed
+        telluric:   (T, N)   T_tell, the telluric transmission time series
+                             (the model's regression target, never scaled)
         theta: {
             "time":          (T,)
             "metadata":      (T, 3)   pressure, temperature, humidity
-            "output_params": (T, P)   the P regression targets
+            "output_params": (T, P)   the P telluric parameters (kept for
+                                      analysis; not a training target)
         }
         night_id:   int      index in [0, n_nights)
         star_index: int      index into the stellar pool
-    ``time`` and ``metadata`` are model *inputs*; ``output_params`` are the
-    regression *targets* and are never fed to the model. With a ``scaler`` all
+    ``time`` and ``metadata`` are model *inputs*; ``telluric`` is the
+    regression *target*; ``output_params`` are never fed to the model. With a ``scaler`` all
     three are returned in ``[0, 1]`` (each group independently, according to
     which ``data.scale_*`` flags were enabled).    """
 
@@ -185,6 +188,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         return {
             "observed": torch.from_numpy(observed),
             "stellar": torch.from_numpy(s),
+            "telluric": torch.from_numpy(trans),
             "theta": {
                 "time": torch.from_numpy(time),
                 "metadata": torch.from_numpy(metadata),

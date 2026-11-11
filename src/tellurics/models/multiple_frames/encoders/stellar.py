@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tellurics.models.encoders.spectral import _conv_stack
+from tellurics.models.multiple_frames.encoders.spectral import _conv_stack
 
 __all__ = ["StellarEncoder"]
 

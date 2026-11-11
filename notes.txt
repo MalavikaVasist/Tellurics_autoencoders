@@ -12,7 +12,7 @@ num_heads
 fusion_hidden
 fusion_layers
 dropout
-param_decoder_hidden
+telluric_decoder_hidden
 metadata_enc_hidden
 
 Main architecture: 

@@ -1,25 +1,33 @@
 
 """
-Train the whole-night telluric parameter estimator.
+Train one telluric estimator: the whole-night model or a single-frame model.
+
+Four experiments share this script; each has its own manifest and the
+``model.architecture`` value selects both the model and the sample type:
+
+    experiments/experiment.yaml                  neural_telluric_predictor  (B, T, N)
+    experiments/experiment_cnn_ae.yaml           cnn_autoencoder            (B, 1, N)
+    experiments/experiment_transformer_ae.yaml   transformer_autoencoder    (B, 1, N)
+    experiments/experiment_specpt.yaml           specpt                     (B, 1, N)
 
 Pipeline
 --------
-1. Load the night-major telluric HDF5 dataset. It contains 4,500 nights,
-   each with 73 frames and 51,557 wavelength samples. The file is prepared
-   beforehand by reshaping the flat telluric dataset in
-   tests/testing_dataset_reshape.ipynb.
+1. Load the night-major telluric HDF5 dataset (nights x 73 frames x 51,557
+   wavelength samples), prepared by tests/testing_dataset_reshape.ipynb.
 
-2. TelluricDataModule loads complete nights, pairs each with a fixed,
-   seeded PHOENIX stellar spectrum, and provides:
-   - observed spectra: (B, T, N)
+2. TelluricDataModule pairs each night with a fixed, seeded PHOENIX stellar
+   spectrum and serves either whole nights or, for single-frame models,
+   single exposures (night-level split either way):
+   - observed spectra: (B, T, N)  or (B, 1, N)
    - stellar spectra: (B, N)
-   - target parameters in theta: time, atmospheric metadata
-     (pressure, temperature, humidity), and 16 output parameters.
+   - telluric transmission (target): (B, T, N)  or (B, 1, N)
+   - theta: time, atmospheric metadata (pressure, temperature, humidity)
+     as inputs, plus the 16 telluric parameters (not used in the loss).
 
 3. TelluricTrainingModule trains and validates the estimator by minimizing
-   mean squared error (MSE) between predicted and target parameters:
+   mean squared error (MSE) between predicted and true telluric spectra:
 
-       loss = MSE(estimator(...).params, theta["output_params"])
+       loss = MSE(estimator(...).telluric, batch["telluric"])
 
 Configuration
 -------------
@@ -30,7 +38,7 @@ the optimizer, number of epochs, batch size, and logging.
 Each run saves its configuration, stellar assignments, logs, and
 checkpoints in its output directory:
 
-    runs/experiment1/
+    runs/<experiment>/
     ├── config.yaml
     ├── stellar_assignment.csv
     ├── logs/
@@ -40,12 +48,15 @@ Examples
 --------
 Train using an experiment configuration:
 
-    python -m tellurics.scripts.train --config experiments/experiment1.yaml
+    python -m tellurics.scripts.train --config experiments/experiment.yaml
+    python -m tellurics.scripts.train --config experiments/experiment_cnn_ae.yaml
+    python -m tellurics.scripts.train --config experiments/experiment_transformer_ae.yaml
+    python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml
 
-Train on CPU or resume from a checkpoint:
+Train on CPU or resume from a checkpoint (checkpoints/<architecture>/):
 
-    python -m tellurics.scripts.train --config experiments/experiment1.yaml \\
-        --device cpu --resume runs/experiment1/checkpoints/neural_telluric_predictor/x.ckpt
+    python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml \\
+        --device cpu --resume runs/specpt/checkpoints/specpt/x.ckpt
 """
 import argparse
 from pathlib import Path
@@ -61,13 +72,13 @@ from pytorch_lightning.loggers import WandbLogger
 
 from tellurics.config import (
     DataConfig,
+    AnyModelConfig,
     ExperimentConfig,
-    ModelConfig,
     TrainingConfig,
     WandbConfig,
     load_config,
 )
-from tellurics.data.datamodule import TelluricDataModule, build_scaler
+from tellurics.data.datamodule import TelluricDataModule
 from tellurics.training.module import TelluricTrainingModule
 from tellurics.utils.logging import get_logger
 
@@ -77,7 +88,7 @@ logger = get_logger(__name__)
 def parse_args() -> argparse.Namespace:
     """Parse the deliberately tiny CLI: the manifest plus two run overrides."""
     parser = argparse.ArgumentParser(
-        description="Train the whole-night telluric parameter estimator."
+        description="Train the whole-night telluric time-series estimator."
     )
     parser.add_argument(
         "--config", type=Path, required=True,
@@ -140,7 +151,10 @@ def prepare_run_dir(config: ExperimentConfig) -> Path:
 
 
 def build_datamodule(
-    data: DataConfig, training: TrainingConfig, run_dir: Path
+    data: DataConfig,
+    training: TrainingConfig,
+    run_dir: Path,
+    single_frame: bool = False,
 ) -> TelluricDataModule:
     """Build the DataModule, failing early on missing inputs."""
     if not data.night_h5.exists():
@@ -160,28 +174,26 @@ def build_datamodule(
         run_dir=run_dir,
         batch_size=training.batch_size,
         num_workers=training.num_workers,
+        single_frame=single_frame,
     )
 
 
 def build_model(
-    model_config: ModelConfig,
+    model_config: AnyModelConfig,
     training_config: TrainingConfig,
-    data_config: DataConfig | None = None,
 ) -> TelluricTrainingModule:
     """Build the LightningModule (registry-resolved estimator) to train.
     """
+    frames = (
+        "single frame (T=1)" if model_config.single_frame
+        else f"T={model_config.n_frames_per_series}"
+    )
     logger.info(
         f"Training {model_config.architecture.value} | "
-        f"N={model_config.num_wavelength_bins}, "
-        f"T={model_config.n_frames_per_series}, "
-        f"metadata_dim={model_config.metadata_dim}, "
-        f"param_dim={model_config.param_dim}"
+        f"N={model_config.num_wavelength_bins}, {frames}, "
+        f"telluric_activation={model_config.telluric_activation.value}"
     )
-    return TelluricTrainingModule(
-        model_config,
-        training_config,
-        scaler=build_scaler(data_config) if data_config is not None else None,
-    )
+    return TelluricTrainingModule(model_config, training_config)
 
 
 def build_trainer(
@@ -189,6 +201,7 @@ def build_trainer(
     wandb_config: WandbConfig,
     run_dir: Path,
     device: str,
+    architecture: str = "neural_telluric_predictor",
 ) -> pl.Trainer:
     """Build the Trainer: callbacks, W&B logger and device placement."""
     checkpoint_dir = run_dir / config.checkpoint_dir
@@ -196,7 +209,7 @@ def build_trainer(
 
     callbacks: list[pl.Callback] = [
         ModelCheckpoint(
-            dirpath=checkpoint_dir / "neural_telluric_predictor",
+            dirpath=checkpoint_dir / architecture,
             monitor=config.monitor_metric,
             mode="min",
             every_n_epochs=config.save_every_n_epochs,
@@ -248,12 +261,13 @@ def train(
     run_dir: Path,
     device: str,
     resume: Path | None,
+    architecture: str = "neural_telluric_predictor",
 ) -> None:
     """Build the Trainer and run ``fit`` (optionally resuming a checkpoint)."""
     if resume is not None and not resume.exists():
         raise FileNotFoundError(f"checkpoint to resume from not found: {resume}")
 
-    trainer = build_trainer(config, wandb_config, run_dir, device)
+    trainer = build_trainer(config, wandb_config, run_dir, device, architecture)
     trainer.fit(
         model,
         datamodule=datamodule,
@@ -316,8 +330,13 @@ def main() -> None:
     config = apply_overrides(config, args.overrides)
 
     run_dir = prepare_run_dir(config)
-    datamodule = build_datamodule(config.data, config.training, run_dir)
-    model = build_model(config.model, config.training, data_config=config.data)
+    # Single-frame models train on single exposures (B, 1, N); the whole-night
+    # model on whole nights (B, T, N). Decided by the model config alone.
+    datamodule = build_datamodule(
+        config.data, config.training, run_dir,
+        single_frame=config.model.single_frame,
+    )
+    model = build_model(config.model, config.training)
 
     train(
         model=model,
@@ -327,6 +346,7 @@ def main() -> None:
         run_dir=run_dir,
         device=args.device,
         resume=args.resume,
+        architecture=config.model.architecture.value,
     )
 
 

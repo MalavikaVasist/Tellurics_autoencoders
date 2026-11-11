@@ -1,5 +1,6 @@
-"""Datasets: one sample = one whole night."""
+"""Datasets: one whole night (TelluricTimeseriesDataset) or one exposure (TelluricFrameDataset)."""
 
+from tellurics.data.datasets.frames import TelluricFrameDataset
 from tellurics.data.datasets.timeseries import (
     METADATA_COLUMNS,
     PHYSICAL_COLUMNS,
@@ -10,6 +11,7 @@ from tellurics.data.datasets.timeseries import (
 
 __all__ = [
     "TelluricTimeseriesDataset",
+    "TelluricFrameDataset",
     "TIME_COLUMN",
     "METADATA_COLUMNS",
     "PHYSICAL_COLUMNS",

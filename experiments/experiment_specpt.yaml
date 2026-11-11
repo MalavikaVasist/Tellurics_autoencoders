@@ -1,0 +1,99 @@
+# Experiment 4: SpecPT adapted to single full-resolution frames
+#
+#   observed X = T*S (B, 1, N=51557) -> flatten (B, N) -> SpecPT -> telluric_pred (B, 1, N)
+#   loss = MSE(T_tell, telluric_pred)
+#
+# Model: tellurics.models.single_frame.specpt.SpecPT
+#   SpecPT conv stem (k=41/21/11, stride 2, BN, ReLU, MaxPool) -> token conv (x8)
+#   -> 403 tokens -> TransformerEncoder -> TransformerDecoder(tgt=enc, memory=enc)
+#   -> per-token linear1/ReLU/linear2 reconstructs 128 samples per token -> (B, N)
+#   (see the module docstring for what changed w.r.t. the original SpecPT)
+#
+# One sample = ONE exposure (night-level split).
+#
+# Run:
+#   python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml
+
+# Artefacts (config.yaml, stellar_assignment.csv, logs/, checkpoints/) land here.
+run_dir: runs/specpt
+
+# Weights & Biases: project the metrics go to + this run's display title.
+wandb:
+  project: neural_telluric_predictor
+  title: specpt
+  mode: offline  # "online" | "offline" | "disabled"
+
+model:
+  architecture: specpt
+  num_wavelength_bins: 51557             # spectral samples N
+  stem_channels: [64, 128, 256]          # SpecPT conv stem
+  stem_kernels: [41, 21, 11]             # SpecPT conv stem (odd)
+  token_stride: 8                        # tokens cover 16*8 = 128 samples -> 403 tokens
+  d_model: 512                           # SpecPT defaults below
+  num_heads: 8
+  num_encoder_layers: 3
+  num_decoder_layers: 3
+  dim_feedforward: 2048
+  head_hidden: 512                       # linear1 width of the per-token reconstruction head
+  dropout: 0.1
+  telluric_activation: optical_depth     # T = exp(-softplus(z)) in (0, 1]  (optical_depth | sigmoid | none)
+
+data:
+  # External data root. ${TELLURICS_DATA} is expanded by load_config from the
+  # environment (YAML does not expand variables), so this same manifest works
+  # on every machine; the paths below are relative to it.
+  root: "${TELLURICS_DATA}"
+  night_h5: telluric_timeseries/telluric_templates_nights.h5   # built by tests/testing_dataset_reshape.ipynb
+  phoenix_dir: phoenix/convolved    # stellar *.fits pool
+  stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
+  max_nights: 10000                        # subset: first 100 nights only (not a random sample)
+  scale_metadata: true                   # metadata  (pressure, temperature, humidity) -> [0,1]
+  scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
+  scale_time: true                       # time_hours -> [0,1]  (time_hours / 16)
+  param_bounds:
+    time_hours: [0.0, 6.0]              # h    
+    pressure: [600.0, 850.0]             # hPa
+    temperature: [233.15, 318.15]        # K    (-40 .. +45 degC)
+    humidity: [0.0, 100.0]               # %
+    angle: [0.0, 90.0]                   # deg  (zenith angle)
+    airmass: [1.0, 2.0]                  # sec(z), altitude >= 30 deg
+    co2: [420.0, 435.0]                  # ppmv
+    o3: [0.018, 0.0429]                  # ppmv
+    n2o: [0.335, 0.345]                  # ppmv
+    co: [0.088, 0.169]                   # ppmv
+    ch4: [1.90, 1.98]                    # ppmv
+    o2: [205800.0, 214200.0]             # ppmv
+    "no": [1.0e-19, 1.2e-19]             # ppmv (log-uniform in the generator; quoted key: bare 'no' is YAML boolean False)
+    so2: [9.8e-5, 1.02e-4]               # ppmv
+    no2: [2.57e-5, 1.0e-4]               # ppmv
+    nh3: [9.8e-5, 1.02e-4]               # ppmv
+    hno3: [1.74e-5, 5.6e-4]              # ppmv
+
+  # Night-level split (test = 1 - train - val).
+  train_fraction: 0.8
+  val_fraction: 0.1
+  seed: 42                               # seeds the split + stellar assignment
+  pin_memory: true                       # DataLoader pin_memory
+
+training:
+  optimizer:
+    optimizer_type: adam                 # OptimizerType enum value (adam | sgd)
+    learning_rate: 1e-4
+    weight_decay: 1e-4
+  scheduler:
+    scheduler_type: cosine               # SchedulerType enum value
+    min_lr: 1e-6
+  max_epochs: 30                     # one epoch = every exposure of every training night (73 x nights)
+  precision: 16-mixed                    # use "32" on a CPU-only machine
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1             # accumulate gradients over this many batches before stepping the optimizer
+  val_check_interval: 1.0                # epochs (or fraction) between validations
+  log_every_n_steps: 10                  # Trainer logging cadence
+  log_dir: logs                          # relative to run_dir (W&B local files) 
+  batch_size: 16                         # single exposures per batch
+  num_workers: 2                         # DataLoader workers
+  save_every_n_epochs: 30                # save checkpoints every N epochs (set to max_epochs to save only the final checkpoint)
+  monitor_metric: validation_loss        # must match a metric the module logs
+  early_stopping_patience: 5
+  checkpoint_dir: checkpoints            # relative to run_dir
+

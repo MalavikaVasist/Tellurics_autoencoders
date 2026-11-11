@@ -473,7 +473,7 @@ class TestParameterScalerGroups:
 
 
 # --------------------------------------------------------------------------- #
-# The training / loss pipeline on scaled targets
+# The training / loss pipeline on the telluric time series
 # --------------------------------------------------------------------------- #
 def _tiny_model_config() -> ModelConfig:
     """Small ``ModelConfig`` matching the synthetic nights of this module."""
@@ -482,7 +482,6 @@ def _tiny_model_config() -> ModelConfig:
         num_wavelength_bins=N_WAVE,
         n_frames_per_series=N_FRAMES,
         metadata_dim=len(METADATA_COLUMNS),
-        param_dim=len(TARGET_COLUMNS),
         num_queries=2,
         spectral_latent_dim=8,
         num_heads=2,
@@ -499,42 +498,60 @@ def _tiny_model_config() -> ModelConfig:
         metadata_enc_dim=4,
         metadata_enc_hidden=None,
         time_enc_dim=4,
-        param_decoder_hidden=None,
-        param_activation="sigmoid",
+        telluric_decoder_hidden=None,
+        telluric_activation="optical_depth",
     )
 
 
-def _training_module(scaler: ParameterScaler | None = None) -> TelluricTrainingModule:
-    """Tiny LightningModule, optionally wired to a scaler."""
+def _training_module() -> TelluricTrainingModule:
+    """Tiny LightningModule."""
     return TelluricTrainingModule(
         _tiny_model_config(),
         TrainingConfig(max_epochs=1, precision="32"),
-        scaler=scaler,
     )
 
 
 def _batch(night_file) -> dict:
-    """One collated batch (2 nights) of the synthetic file."""
-    loader = DataLoader(_dataset(night_file, [0, 1], DataConfig()), batch_size=2)
+    """One collated batch (2 nights) of the synthetic file.
+
+    ``clip=True``: these tests exercise the telluric target, not the label
+    bounds, so they must not depend on the fixture sitting inside them.
+    """
+    loader = DataLoader(
+        _dataset(night_file, [0, 1], DataConfig(), clip=True), batch_size=2
+    )
     return next(iter(loader))
 
 
-class TestTrainingPipelineWithScaledTargets:
-    """``MSE(param_pred, params)`` with both sides on ``[0, 1]`` still trains."""
+class TestTrainingPipelineOnTellurics:
+    """``MSE(telluric_pred, T_tell)`` on the full (B, T, N) time series."""
+
+    def test_dataset_returns_the_unscaled_transmission(self, night_file) -> None:
+        """The target is the raw transmission, untouched by the label scaler."""
+        sample = _dataset(night_file, [0], DataConfig(), clip=True)[0]
+        assert sample["telluric"].shape == (N_FRAMES, N_WAVE)
+        assert torch.allclose(sample["telluric"], torch.full((N_FRAMES, N_WAVE), 0.5))
+        # observed is built from exactly this transmission
+        assert torch.allclose(
+            sample["observed"], sample["telluric"] * sample["stellar"][None, :]
+        )
 
     def test_loss_is_finite_and_both_sides_are_bounded(self, night_file) -> None:
         module = _training_module()
         batch = _batch(night_file)
-        pred = module._run_estimator(batch).params
-        target = batch["theta"]["output_params"]
+        pred = module._run_estimator(batch).telluric
+        target = batch["telluric"]
 
-        assert bool(((pred >= 0.0) & (pred <= 1.0)).all())
+        assert pred.shape == target.shape == (2, N_FRAMES, N_WAVE)
+        assert bool(((pred > 0.0) & (pred <= 1.0)).all())
         assert bool(((target >= 0.0) & (target <= 1.0)).all())
         loss = F.mse_loss(pred, target)
         assert torch.isfinite(loss)
 
     def test_one_lightning_train_and_val_step_completes(self, night_file) -> None:
-        loader = DataLoader(_dataset(night_file, [0, 1], DataConfig()), batch_size=2)
+        loader = DataLoader(
+            _dataset(night_file, [0, 1], DataConfig(), clip=True), batch_size=2
+        )
         trainer = pl.Trainer(
             fast_dev_run=True,
             logger=False,
@@ -551,82 +568,8 @@ class TestTrainingPipelineWithScaledTargets:
         )
         assert trainer.state.status == "finished"
 
-
-class TestPredictPhysical:
-    """``predict_physical`` is the inverse of the dataset's forward scaling."""
-
-    def test_predict_step_stays_normalized(self, night_file) -> None:
-        module = _training_module(build_scaler(DataConfig())).eval()
+    def test_predict_step_returns_the_telluric_time_series(self, night_file) -> None:
+        module = _training_module().eval()
         with torch.no_grad():
-            params = module.predict_step(_batch(night_file), 0).params
-        assert bool(((params >= 0.0) & (params <= 1.0)).all())
-
-    def test_predict_physical_inverts_the_scaling(self, night_file) -> None:
-        scaler = build_scaler(DataConfig())
-        module = _training_module(scaler).eval()
-        batch = _batch(night_file)
-
-        with torch.no_grad():
-            normalized = module.predict_step(batch, 0)
-            physical = module.predict_physical(batch)
-
-        assert torch.allclose(
-            physical.params, scaler.inverse_params_torch(normalized.params)
-        )
-
-    def test_predictions_land_inside_the_declared_physical_range(
-        self, night_file
-    ) -> None:
-        """A bounded head + the inverse bound every physical prediction."""
-        scaler = build_scaler(DataConfig())
-        with torch.no_grad():
-            params = _training_module(scaler).eval().predict_physical(
-                _batch(night_file)
-            ).params
-
-        low = torch.as_tensor(scaler.params.minimum, dtype=params.dtype)
-        high = torch.as_tensor(scaler.params.maximum, dtype=params.dtype)
-        assert bool((params >= low).all())
-        assert bool((params <= high).all())
-        # e.g. pressure comes back in hPa, not as a 0-1 fraction.
-        pressure = TARGET_COLUMNS.index("pressure")
-        assert float(params[..., pressure].min()) >= 600.0
-        assert float(params[..., pressure].max()) <= 850.0
-
-    def test_non_parameter_fields_pass_through(self, night_file) -> None:
-        module = _training_module(build_scaler(DataConfig())).eval()
-        batch = _batch(night_file)
-        with torch.no_grad():
-            normalized = module.predict_step(batch, 0)
-            physical = module.to_physical(normalized)
-
-        assert torch.equal(physical.latent, normalized.latent)
-        assert torch.equal(physical.attention_weights, normalized.attention_weights)
-        assert physical.intermediate_features is normalized.intermediate_features
-
-    def test_identity_without_a_scaler(self, night_file) -> None:
-        module = _training_module(None).eval()
-        batch = _batch(night_file)
-        with torch.no_grad():
-            assert torch.equal(
-                module.predict_physical(batch).params,
-                module.predict_step(batch, 0).params,
-            )
-
-    def test_identity_when_scale_params_is_false(self, night_file) -> None:
-        scaler = build_scaler(DataConfig(scale_params=False))
-        module = _training_module(scaler).eval()
-        batch = _batch(night_file)
-        assert not scaler.scale_params
-        with torch.no_grad():
-            assert torch.equal(
-                module.predict_physical(batch).params,
-                module.predict_step(batch, 0).params,
-            )
-
-    def test_scaler_is_not_written_into_the_hparams(self) -> None:
-        """Checkpoints stay scaler-free: it is rebuilt from config.yaml."""
-        scaler = build_scaler(DataConfig())
-        module = _training_module(scaler)
-        assert module.scaler is scaler
-        assert "scaler" not in module.hparams
+            out = module.predict_step(_batch(night_file), 0)
+        assert out.telluric.shape == (2, N_FRAMES, N_WAVE)

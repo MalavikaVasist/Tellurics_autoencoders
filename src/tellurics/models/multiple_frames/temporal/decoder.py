@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from tellurics.models.temporal.attention import _CrossAttentionBlock
+from tellurics.models.multiple_frames.temporal.attention import _CrossAttentionBlock
 
 __all__ = ["TemporalDecoder"]
 

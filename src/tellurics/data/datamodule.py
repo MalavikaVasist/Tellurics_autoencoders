@@ -2,8 +2,10 @@
 Lightning DataModule for whole-night telluric training.
 
 Combines the shared wavelength grid, PHOENIX stellar spectra, night-level
-train/validation/test splits, and the timeseries dataset. Each dataset
-sample represents one complete night of observations.
+train/validation/test splits, and the dataset. A sample is either one
+complete night ``(T, N)`` (whole-night models) or, with ``single_frame=True``,
+one exposure ``(1, N)`` (single-frame models). The split is night-level in
+both cases.
 
 Each night is paired with one fixed, seeded stellar spectrum:
     observed = transmission * stellar_flux
@@ -18,6 +20,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 
 from tellurics.config.data import DataConfig
+from tellurics.data.datasets.frames import TelluricFrameDataset
 from tellurics.data.datasets.timeseries import (
     METADATA_COLUMNS,
     TARGET_COLUMNS,
@@ -43,11 +46,11 @@ def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
     A pure function of ``data.param_bounds`` and the three ``data.scale_*``
     flags: no statistic is read off the data and no split is involved, so the
     scaler is identical for train/val/test and can be rebuilt from a run's
-    ``config.yaml`` alone -- which is how a prediction is mapped back to
-    physical units at inference time::
+    ``config.yaml`` alone, e.g. to map ``theta["output_params"]`` back to
+    physical units::
 
         scaler = build_scaler(load_config("runs/<run>/config.yaml").data)
-        physical = scaler.inverse_params(pred.params)
+        physical = scaler.inverse_params(batch["theta"]["output_params"])
 
     With ``clip`` the forward transform clamps physical values to the declared
     bounds instead of raising. The data module enables it for the test split
@@ -74,9 +77,11 @@ class TelluricDataModule(pl.LightningDataModule):
             ``data:`` section).
         run_dir: This run's artefact directory; the night -> star audit CSV is
             written to ``<run_dir>/stellar_assignment.csv``.
-        batch_size: Whole nights per batch (the manifest's ``training:``
-            section).
+        batch_size: Samples per batch -- whole nights, or single exposures
+            with ``single_frame`` (the manifest's ``training:`` section).
         num_workers: DataLoader workers (the manifest's ``training:`` section).
+        single_frame: Serve single exposures ``(1, N)`` instead of whole
+            nights (set from the model config's ``single_frame``).
     """
 
     def __init__(
@@ -85,6 +90,7 @@ class TelluricDataModule(pl.LightningDataModule):
         run_dir: str | Path,
         batch_size: int = 4,
         num_workers: int = 2,
+        single_frame: bool = False,
     ) -> None:
         """Initialize."""
         super().__init__()
@@ -93,6 +99,7 @@ class TelluricDataModule(pl.LightningDataModule):
         self.run_dir = Path(run_dir)
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.single_frame = single_frame
 
     # -- attributes set by setup() ------------------------------------------ #
     wavegrid: Wavegrid | None = None
@@ -212,16 +219,23 @@ class TelluricDataModule(pl.LightningDataModule):
             pool=self.stellar_pool,
             star_assignment=self.stellar_assignment,
         )
+        dataset_cls = TelluricTimeseriesDataset
+        if self.single_frame:
+            dataset_cls = TelluricFrameDataset
+            common["n_frames"] = self.n_frames
+            logger.info(
+                f"single-frame samples: {self.n_frames} exposures per night"
+            )
         test_scaler = (
             None if self.scaler is None else build_scaler(self.config, clip=True)
         )
-        self.train_ds = TelluricTimeseriesDataset(
+        self.train_ds = dataset_cls(
             night_ids=self.train_ids, scaler=self.scaler, **common
         )
-        self.val_ds = TelluricTimeseriesDataset(
+        self.val_ds = dataset_cls(
             night_ids=self.val_ids, scaler=self.scaler, **common
         )
-        self.test_ds = TelluricTimeseriesDataset(
+        self.test_ds = dataset_cls(
             night_ids=self.test_ids, scaler=test_scaler, **common
         )
 
