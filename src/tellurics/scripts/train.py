@@ -5,10 +5,13 @@ Train one telluric estimator: the whole-night model or a single-frame model.
 Four experiments share this script; each has its own manifest and the
 ``model.architecture`` value selects both the model and the sample type:
 
-    experiments/experiment.yaml                  neural_telluric_predictor  (B, T, N)
-    experiments/experiment_cnn_ae.yaml           cnn_autoencoder            (B, 1, N)
-    experiments/experiment_transformer_ae.yaml   transformer_autoencoder    (B, 1, N)
-    experiments/experiment_specpt.yaml           specpt                     (B, 1, N)
+    experiments/multiple_frames/experiment.yaml               neural_telluric_predictor  (B, T, N)
+    experiments/single_frame/experiment_cnn_ae.yaml           cnn_autoencoder            (B, 1, N)
+    experiments/single_frame/experiment_transformer_ae.yaml   transformer_autoencoder    (B, 1, N)
+    experiments/single_frame/experiment_specpt.yaml           specpt                     (B, 1, N)
+
+The manifest folders mirror ``tellurics.models``: ``multiple_frames/`` for the
+whole-night model, ``single_frame/`` for the single-exposure autoencoders.
 
 Pipeline
 --------
@@ -48,14 +51,14 @@ Examples
 --------
 Train using an experiment configuration:
 
-    python -m tellurics.scripts.train --config experiments/experiment.yaml
-    python -m tellurics.scripts.train --config experiments/experiment_cnn_ae.yaml
-    python -m tellurics.scripts.train --config experiments/experiment_transformer_ae.yaml
-    python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml
+    python -m tellurics.scripts.train --config experiments/multiple_frames/experiment.yaml
+    python -m tellurics.scripts.train --config experiments/single_frame/experiment_cnn_ae.yaml
+    python -m tellurics.scripts.train --config experiments/single_frame/experiment_transformer_ae.yaml
+    python -m tellurics.scripts.train --config experiments/single_frame/experiment_specpt.yaml
 
 Train on CPU or resume from a checkpoint (checkpoints/<architecture>/):
 
-    python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml \\
+    python -m tellurics.scripts.train --config experiments/single_frame/experiment_specpt.yaml \\
         --device cpu --resume runs/specpt/checkpoints/specpt/x.ckpt
 """
 import argparse

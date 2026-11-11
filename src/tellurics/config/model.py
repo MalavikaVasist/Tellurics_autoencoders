@@ -55,7 +55,7 @@ class ModelConfig(BaseModel):
     """Configuration for the whole-night telluric time-series estimator.
 
     No field carries a default: every value is a design or data decision and
-    must be stated by the manifest (see ``experiments/``).  All fields are
+    must be stated by the manifest (see ``experiments/multiple_frames/``).  All fields are
     consumed by :mod:`tellurics.models.multiple_frames.predictor`; see that module's docstring for
     the shape-annotated data flow.
     """

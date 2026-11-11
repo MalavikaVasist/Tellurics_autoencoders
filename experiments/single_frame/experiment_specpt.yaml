@@ -12,7 +12,7 @@
 # One sample = ONE exposure (night-level split).
 #
 # Run:
-#   python -m tellurics.scripts.train --config experiments/experiment_specpt.yaml
+#   python -m tellurics.scripts.train --config experiments/single_frame/experiment_specpt.yaml
 
 # Artefacts (config.yaml, stellar_assignment.csv, logs/, checkpoints/) land here.
 run_dir: runs/specpt

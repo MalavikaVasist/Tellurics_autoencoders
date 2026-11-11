@@ -5,7 +5,7 @@
 #
 # Run:
 #   python -m src.tellurics.scripts.train \
-    # --config experiments/experiment1_smoke.yaml \
+    # --config experiments/multiple_frames/experiment1_smoke.yaml \
     # --set training.optimizer.learning_rate=0.001 \
     # --set model.dropout=0.2 \
     # --device gpu

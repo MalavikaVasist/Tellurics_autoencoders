@@ -2,7 +2,7 @@
 
 The bounds are no longer hard-coded in :mod:`tellurics.config.parameters`: every
 experiment declares them explicitly in its manifest under ``data.param_bounds``
-(see ``experiments/experiment1.yaml``). The tests assert exact scaled values, so
+(see ``experiments/multiple_frames/experiment.yaml``). The tests assert exact scaled values, so
 they build their configs from this fixed table instead of reading a manifest
 file.
 """
@@ -14,7 +14,7 @@ from pydantic import Field
 from tellurics.config.parameters import Parameters
 from tellurics.config.data import DataConfig
 
-# The production envelope (see experiments/experiment1.yaml). ``time_hours``
+# The production envelope (see experiments/multiple_frames/experiment.yaml). ``time_hours``
 # keeps the original [0, 16] so the tests can assert ``time_hours / 16``.
 BOUNDS: dict[str, tuple[float, float]] = {
     "time_hours": (0.0, 16.0),

@@ -15,7 +15,7 @@
 #      code to the full 51557-sample telluric transmission
 #
 # Run:
-#   python -m tellurics.scripts.train --config experiments/experiment.yaml
+#   python -m tellurics.scripts.train --config experiments/multiple_frames/experiment.yaml
 #
 # Contract with tellurics.data.datamodule (must not be changed blindly):
 #   metadata_dim        == 3       # pressure, temperature, humidity (per exposure)

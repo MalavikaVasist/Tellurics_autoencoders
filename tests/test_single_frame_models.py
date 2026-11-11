@@ -88,10 +88,10 @@ class TestConfigs:
     @pytest.mark.parametrize(
         "fname, cls, single_frame",
         [
-            ("experiment.yaml", ModelConfig, False),
-            ("experiment_cnn_ae.yaml", CNNAutoencoderConfig, True),
-            ("experiment_transformer_ae.yaml", TransformerAutoencoderConfig, True),
-            ("experiment_specpt.yaml", SpecPTConfig, True),
+            ("multiple_frames/experiment.yaml", ModelConfig, False),
+            ("single_frame/experiment_cnn_ae.yaml", CNNAutoencoderConfig, True),
+            ("single_frame/experiment_transformer_ae.yaml", TransformerAutoencoderConfig, True),
+            ("single_frame/experiment_specpt.yaml", SpecPTConfig, True),
         ],
     )
     def test_each_manifest_selects_its_own_model_config(
@@ -102,22 +102,30 @@ class TestConfigs:
         assert cfg.model.single_frame is single_frame
         assert cfg.model.num_wavelength_bins == 51557
 
+    def test_manifest_folders_mirror_the_model_packages(self) -> None:
+        """experiments/multiple_frames/ -> whole night, single_frame/ -> one exposure."""
+        for folder, single in (("multiple_frames", False), ("single_frame", True)):
+            manifests = sorted((REPO / "experiments" / folder).glob("*.yaml"))
+            assert manifests, folder
+            for path in manifests:
+                assert load_config(path).model.single_frame is single, path.name
+
     def test_runs_do_not_share_a_run_dir(self) -> None:
-        names = ["experiment", "experiment_cnn_ae",
-                 "experiment_transformer_ae", "experiment_specpt"]
+        names = ["multiple_frames/experiment", "single_frame/experiment_cnn_ae",
+                 "single_frame/experiment_transformer_ae", "single_frame/experiment_specpt"]
         dirs = {load_config(REPO / "experiments" / f"{n}.yaml").run_dir for n in names}
         assert len(dirs) == 4
 
     def test_fields_of_another_architecture_are_rejected(self) -> None:
         """A CNN config must not silently accept transformer fields."""
-        raw = load_config(REPO / "experiments" / "experiment_cnn_ae.yaml").model_dump(mode="json")
+        raw = load_config(REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml").model_dump(mode="json")
         raw["model"]["patch_size"] = 128          # transformer-only field
         raw["model"].pop("latent_dim")            # and a missing CNN field
         with pytest.raises(ValidationError):
             ExperimentConfig(**raw)
 
     def test_unknown_architecture_is_rejected(self) -> None:
-        raw = load_config(REPO / "experiments" / "experiment_specpt.yaml").model_dump(mode="json")
+        raw = load_config(REPO / "experiments" / "single_frame" / "experiment_specpt.yaml").model_dump(mode="json")
         raw["model"]["architecture"] = "unet"
         with pytest.raises(ValidationError):
             ExperimentConfig(**raw)
@@ -200,14 +208,14 @@ class TestSingleFrameModels:
 
     def test_specpt_full_resolution_geometry(self) -> None:
         """The repo manifest gives 403 tokens of 128 samples at N = 51557."""
-        cfg = load_config(REPO / "experiments" / "experiment_specpt.yaml").model
+        cfg = load_config(REPO / "experiments" / "single_frame" / "experiment_specpt.yaml").model
         m = SpecPT(cfg)
         assert (m.n_tokens, m.downsample, m.pad) == (403, 128, 27)
 
     def test_cnn_decoder_covers_the_grid(self) -> None:
         m = _model("cnn_autoencoder")
         assert m.dec_len >= N
-        cfg = load_config(REPO / "experiments" / "experiment_cnn_ae.yaml").model
+        cfg = load_config(REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml").model
         full = CNNAutoencoder(cfg)
         assert full.enc_len == 1612 and full.dec_len == 51584
 

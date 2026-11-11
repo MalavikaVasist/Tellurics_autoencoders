@@ -2,7 +2,8 @@ For the code to run,
 1. you first need to run python Tellurics/simulations/phoenix/download_pool.py. This will download some 20 stars in the Tellurics/simulation/phoenix/configs
 /phoenix_pool.csv file, and convolve and resample them to the grid with 51557 data points. These are stored as fits files. then when the datamodule is loaded, it  randomly generates star indices  per night and combines their spectra with the tellurics just before training. 
 2. run testing_dataset_reshape.ipynb to reshape the dataset.
-3. Then you can run python -m tellurics.scripts.train --config experiments/experiment1.yaml --device gpu
+3. Then you can run python -m tellurics.scripts.train --config experiments/multiple_frames/experiment.yaml --device gpu
+   (single-frame models: experiments/single_frame/experiment_{cnn_ae,transformer_ae,specpt}.yaml)
 4. sweep across parameters, 
 spectral_latent_dim
 metadata_enc_dim
@@ -95,8 +96,13 @@ Tellurics/
 │       └── __init__.py
 │
 ├── experiments/
-│   ├── experiment1.yaml
-│   └── experiment1_smoke.yaml
+│   ├── multiple_frames/
+│   │   ├── experiment.yaml
+│   │   └── experiment1_smoke.yaml
+│   └── single_frame/
+│       ├── experiment_cnn_ae.yaml
+│       ├── experiment_transformer_ae.yaml
+│       └── experiment_specpt.yaml
 │
 ├── tools/
 │   └── verify_temporal_model.py

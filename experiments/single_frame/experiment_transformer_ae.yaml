@@ -1,35 +1,38 @@
-# Experiment 2: single-frame 1D-CNN autoencoder
+# Experiment 3: single-frame transformer autoencoder
 #
-#   observed X = T*S (B, 1, N=51557) -> flatten (B, N) -> CNN AE -> telluric_pred (B, 1, N)
+#   observed X = T*S (B, 1, N=51557) -> flatten (B, N) -> transformer AE -> telluric_pred (B, 1, N)
 #   loss = MSE(T_tell, telluric_pred)
 #
-# Model: tellurics.models.single_frame.cnn_autoencoder.CNNAutoencoder
-#   5 x strided Conv1d (/2 each) -> 1x1 squeeze -> flatten -> Linear -> latent (B, 128)
-#   -> Linear -> 5 x ConvTranspose1d (x2 each) -> crop to N -> T = exp(-tau)
+# Model: tellurics.models.single_frame.transformer_autoencoder.TransformerAutoencoder
+#   patches of 128 samples (403 tokens) -> TransformerEncoder
+#   -> 16 learned latent queries (bottleneck 16 x 64)
+#   -> TransformerDecoder from 403 learned per-patch queries -> Linear -> (B, N)
 #
-# One sample = ONE exposure (the data module switches to single frames because
-# this architecture is single-frame). The split is still night-level.
+# One sample = ONE exposure (night-level split).
 #
 # Run:
-#   python -m tellurics.scripts.train --config experiments/experiment_cnn_ae.yaml
+#   python -m tellurics.scripts.train --config experiments/single_frame/experiment_transformer_ae.yaml
 
 # Artefacts (config.yaml, stellar_assignment.csv, logs/, checkpoints/) land here.
-run_dir: runs/cnn_ae
+run_dir: runs/transformer_ae
 
 # Weights & Biases: project the metrics go to + this run's display title.
 wandb:
   project: neural_telluric_predictor
-  title: cnn_ae
+  title: transformer_ae
   mode: offline  # "online" | "offline" | "disabled"
 
 model:
-  architecture: cnn_autoencoder
+  architecture: transformer_autoencoder
   num_wavelength_bins: 51557             # spectral samples N
-  encoder_channels: [16, 32, 64, 96, 128]  # strided encoder; decoder mirrors it
-  kernel_size: 7                         # odd
-  stride: 2                              # 51557 -> 1612 after 5 layers
-  bottleneck_channels: 8                 # 1x1 squeeze before flatten (8 x 1612)
-  latent_dim: 128                        # bottleneck code size
+  patch_size: 128                        # samples per token -> ceil(51557/128) = 403 tokens
+  d_model: 256
+  num_heads: 8
+  num_encoder_layers: 4
+  num_decoder_layers: 4
+  dim_feedforward: 1024
+  num_latents: 16                        # bottleneck tokens
+  latent_dim: 64                         # width of each bottleneck token (code = 16 x 64)
   dropout: 0.1
   telluric_activation: optical_depth     # T = exp(-softplus(z)) in (0, 1]  (optical_depth | sigmoid | none)
 
@@ -85,7 +88,7 @@ training:
   val_check_interval: 1.0                # epochs (or fraction) between validations
   log_every_n_steps: 10                  # Trainer logging cadence
   log_dir: logs                          # relative to run_dir (W&B local files) 
-  batch_size: 32                         # single exposures per batch
+  batch_size: 16                         # single exposures per batch
   num_workers: 2                         # DataLoader workers
   save_every_n_epochs: 30                # save checkpoints every N epochs (set to max_epochs to save only the final checkpoint)
   monitor_metric: validation_loss        # must match a metric the module logs

@@ -56,7 +56,7 @@ def train_trial(
             "-m",
             "src.tellurics.scripts.train",
             "--config",
-            "experiments/experiment.yaml",
+            "experiments/multiple_frames/experiment.yaml",
             "--device",
             "gpu",
             "--set",

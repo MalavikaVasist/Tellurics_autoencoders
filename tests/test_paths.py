@@ -23,6 +23,10 @@ from tests._bounds import BOUNDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS = REPO_ROOT / "experiments"
+# Every tracked manifest, relative to experiments/ (multiple_frames/, single_frame/).
+TRACKED_MANIFESTS = sorted(
+    str(p.relative_to(EXPERIMENTS)) for p in EXPERIMENTS.glob("*/*.yaml")
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -102,7 +106,7 @@ def test_data_config_requires_the_env_var(monkeypatch) -> None:
 # End-to-end: one tracked manifest, two machines
 # --------------------------------------------------------------------------- #
 def test_tracked_manifest_resolves_per_machine(monkeypatch, tmp_path) -> None:
-    manifest = EXPERIMENTS / "experiment1_smoke.yaml"
+    manifest = EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml"
 
     monkeypatch.setenv(DATA_ROOT_ENV, str(tmp_path / "machineA"))
     (tmp_path / "machineA").mkdir()
@@ -122,7 +126,7 @@ def test_tracked_manifest_resolves_per_machine(monkeypatch, tmp_path) -> None:
     assert b.phoenix_dir == (tmp_path / "machineB").resolve() / "phoenix/convolved"
 
 
-@pytest.mark.parametrize("name", ["experiment1.yaml", "experiment1_smoke.yaml"])
+@pytest.mark.parametrize("name", TRACKED_MANIFESTS)
 def test_tracked_manifests_have_no_absolute_data_paths(name: str) -> None:
     """Tracked YAML must stay machine-independent."""
     raw = yaml.safe_load((EXPERIMENTS / name).read_text()) or {}
@@ -135,7 +139,7 @@ def test_tracked_manifests_have_no_absolute_data_paths(name: str) -> None:
         )
 
 
-@pytest.mark.parametrize("name", ["experiment1.yaml", "experiment1_smoke.yaml"])
+@pytest.mark.parametrize("name", TRACKED_MANIFESTS)
 def test_tracked_manifests_declare_the_env_root(name: str) -> None:
     """``data.root`` is the ${TELLURICS_DATA} placeholder, not a machine path."""
     raw = yaml.safe_load((EXPERIMENTS / name).read_text()) or {}
@@ -175,7 +179,7 @@ def test_load_config_expands_root_and_ignores_cwd(monkeypatch, tmp_path) -> None
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
 
-    cfg = load_config(EXPERIMENTS / "experiment1_smoke.yaml").data
+    cfg = load_config(EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml").data
     assert cfg.root == root.resolve()
     assert cfg.night_h5 == root.resolve() / "telluric_timeseries/telluric_templates_nights.h5"
     assert cfg.phoenix_dir == root.resolve() / "phoenix/convolved"
@@ -186,7 +190,7 @@ def test_tracked_manifest_unset_var_raises(monkeypatch) -> None:
     """An unset ``${TELLURICS_DATA}`` must not silently resolve to a path."""
     monkeypatch.delenv(DATA_ROOT_ENV, raising=False)
     with pytest.raises(FileNotFoundError, match=DATA_ROOT_ENV):
-        load_config(EXPERIMENTS / "experiment1_smoke.yaml")
+        load_config(EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml")
 
 
 def test_data_config_rejects_nonexistent_root(monkeypatch, tmp_path) -> None:
