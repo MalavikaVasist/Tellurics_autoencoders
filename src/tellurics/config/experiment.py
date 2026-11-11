@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from tellurics.config.data import DataConfig
 from tellurics.config.model import AnyModelConfig
@@ -39,6 +39,19 @@ class ExperimentConfig(BaseModel):
     model: AnyModelConfig
     data: DataConfig = Field(default_factory=DataConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
+
+
+    @model_validator(mode="after")
+    def _metadata_dim_matches_columns(self) -> "ExperimentConfig":
+        """``model.metadata_dim`` must equal ``len(data.metadata_columns)``."""
+        dim = getattr(self.model, "metadata_dim", None)
+        if dim is not None and dim != len(self.data.metadata_columns):
+            raise ValueError(
+                f"model.metadata_dim={dim} but data.metadata_columns has "
+                f"{len(self.data.metadata_columns)} entries "
+                f"{self.data.metadata_columns}"
+            )
+        return self
 
 
 def load_config(path: str | Path | None) -> ExperimentConfig:

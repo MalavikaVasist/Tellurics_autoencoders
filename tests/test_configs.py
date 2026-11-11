@@ -3,6 +3,7 @@
 import pytest
 
 from tellurics.config.parameters import (
+    OPTIONAL_COLUMNS,
     PHYSICAL_COLUMNS,
     TARGET_COLUMNS,
     TIME_COLUMN,
@@ -108,7 +109,10 @@ class TestDataConfigScaling:
 
     def test_bounds_cover_the_whole_schema(self) -> None:
         bounds = DataConfig(param_bounds=BOUNDS).param_bounds.to_mapping()
-        assert tuple(bounds) == PHYSICAL_COLUMNS
+        # optional columns (pwv) may be left without bounds
+        assert tuple(bounds) == tuple(
+            c for c in PHYSICAL_COLUMNS if c not in OPTIONAL_COLUMNS
+        )
         assert set(TARGET_COLUMNS) <= set(bounds)
         assert bounds[TIME_COLUMN] == (0.0, 16.0)
 

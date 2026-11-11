@@ -4,7 +4,8 @@ Lightning DataModule for whole-night telluric training.
 Combines the shared wavelength grid, PHOENIX stellar spectra, night-level
 train/validation/test splits, and the dataset. A sample is either one
 complete night ``(T, N)`` (whole-night models) or, with ``single_frame=True``,
-one exposure ``(1, N)`` (single-frame models). The split is night-level in
+one observation ``(N,)`` (per-observation models; the exposures of all
+nights pooled). The split is night-level in
 both cases.
 
 Each night is paired with one fixed, seeded stellar spectrum:
@@ -59,8 +60,8 @@ def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
     """
     return ParameterScaler.from_bounds(
         config.param_bounds.to_mapping(),
-        metadata_columns=METADATA_COLUMNS,
-        target_columns=TARGET_COLUMNS,
+        metadata_columns=tuple(config.metadata_columns),
+        target_columns=config.resolved_target_columns,
         time_column=TIME_COLUMN,
         scale_metadata=config.scale_metadata,
         scale_params=config.scale_params,
@@ -80,7 +81,7 @@ class TelluricDataModule(pl.LightningDataModule):
         batch_size: Samples per batch -- whole nights, or single exposures
             with ``single_frame`` (the manifest's ``training:`` section).
         num_workers: DataLoader workers (the manifest's ``training:`` section).
-        single_frame: Serve single exposures ``(1, N)`` instead of whole
+        single_frame: Serve single observations ``(N,)`` instead of whole
             nights (set from the model config's ``single_frame``).
     """
 
@@ -218,7 +219,10 @@ class TelluricDataModule(pl.LightningDataModule):
             h5_path=self.config.night_h5,
             pool=self.stellar_pool,
             star_assignment=self.stellar_assignment,
+            metadata_columns=tuple(self.config.metadata_columns),
+            target_columns=self.config.resolved_target_columns,
         )
+        logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
         dataset_cls = TelluricTimeseriesDataset
         if self.single_frame:
             dataset_cls = TelluricFrameDataset

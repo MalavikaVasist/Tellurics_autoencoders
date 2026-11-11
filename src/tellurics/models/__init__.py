@@ -5,6 +5,7 @@ Layout::
     models/
     |-- output.py           ModelOutput            (shared)
     |-- activations.py      telluric output activation (shared)
+    |-- metadata.py         MetadataEncoder (shared)
     |-- multiple_frames/    whole-night model, (B, T, N) -> (B, T, N)
     +-- single_frame/       single-exposure autoencoders, (B, 1, N) -> (B, 1, N)
 
@@ -18,10 +19,10 @@ every architecture; ``model.architecture`` in a manifest picks one of:
 """
 
 from tellurics.models.activations import apply_telluric_activation, clear_sky_raw_value
+from tellurics.models.metadata import MetadataEncoder
 from tellurics.models.output import ModelOutput
 from tellurics.models.multiple_frames import (
     FusionMLP,
-    MetadataEncoder,
     MultiHeadCrossAttention,
     NeuralTelluricPredictor,
     SpectralEncoder,
@@ -43,11 +44,11 @@ __all__ = [
     "ModelOutput",
     "apply_telluric_activation",
     "clear_sky_raw_value",
+    "MetadataEncoder",
     # Multiple-frame (whole-night) model and its building blocks.
     "NeuralTelluricPredictor",
     "SpectralEncoder",
     "StellarEncoder",
-    "MetadataEncoder",
     "TimeEncoder",
     "MultiHeadCrossAttention",
     "TemporalPerceiver",

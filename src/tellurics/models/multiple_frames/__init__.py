@@ -6,14 +6,15 @@ Layout::
 
     multiple_frames/
     |-- predictor.py   NeuralTelluricPredictor (the whole-night model)
-    |-- encoders/      per-exposure spectral / stellar / metadata / time encoders
+    |-- encoders/      per-exposure spectral / stellar / time encoders
+    |                  (+ the shared MetadataEncoder)
     |-- temporal/      exposure-axis attention (Perceiver compressor + decoder)
     |-- fusion.py      FusionMLP (temporal latent + stellar code)
     +-- decoders/      TelluricDecoder (per-exposure spectrum head)
 
 Shared with the single-frame models (directly under :mod:`tellurics.models`):
-:class:`~tellurics.models.output.ModelOutput` and
-:mod:`tellurics.models.activations`.
+:class:`~tellurics.models.output.ModelOutput`, :mod:`tellurics.models.activations`
+and :class:`~tellurics.models.metadata.MetadataEncoder` (re-exported here).
 """
 
 from tellurics.models.multiple_frames.decoders import TelluricDecoder

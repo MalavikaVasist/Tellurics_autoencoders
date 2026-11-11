@@ -73,20 +73,24 @@ class TelluricTrainingModule(pl.LightningModule):
         stellar: torch.Tensor,
         metadata: torch.Tensor,
         time: torch.Tensor,
+        wavelength: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Run the telluric predictor.
 
         Args:
             observed: Observed spectra with shape (B, T, N).
             stellar: Stellar spectrum with shape (B, N) or (N,).
-            metadata: Pressure, temperature, and humidity with shape (B, T, 3).
+            metadata: The ``data.metadata_columns`` with shape (B, T, M).
             time: Exposure times with shape (B, T).
+            wavelength: Wavelength grid (B, N) (used by the transformer
+                autoencoder as positional encoding; ignored by the others).
 
         Returns:
             ModelOutput containing the predicted telluric time series (B, T, N).
         """
         return self.model(
-            observed, stellar=stellar, metadata=metadata, time=time
+            observed, stellar=stellar, metadata=metadata, time=time,
+            wavelength=wavelength,
         )
 
     # ------------------------------------------------------------------ #
@@ -97,6 +101,7 @@ class TelluricTrainingModule(pl.LightningModule):
             stellar=batch["stellar"],
             metadata=batch["theta"]["metadata"],
             time=batch["theta"]["time"],
+            wavelength=batch.get("wavelength"),
         )
 
     def _shared_step(

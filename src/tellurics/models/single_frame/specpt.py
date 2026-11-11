@@ -1,4 +1,4 @@
-"""SpecPT adapted to full-resolution single-frame telluric extraction.
+"""SpecPT adapted to per-observation telluric extraction.
 
 Based on the SpecPT pre-training autoencoder (conv stem -> transformer
 encoder/decoder -> linear reconstruction). Kept from the original:
@@ -29,14 +29,14 @@ Changed, because the original does not scale to N = 51557 (it was built for
 
 Shape-annotated data flow (defaults, N = 51557 -> padded 51584)::
 
-    observed (B, 1, N) -> flatten (B, N) -> pad (B, 1, 51584)
+    observed (B, N) -> pad (B, 1, N_pad)
         | stem 3 x [Conv1d s=2 + BN + ReLU], MaxPool s=2   (B, 256, 3224)
         | token Conv1d(256 -> 512, k=s=8)                   (B, 512, 403)
         | + pos-emb -> TransformerEncoder                   (B, 403, 512)
         | TransformerDecoder(tgt=encoded, memory=encoded)   (B, 403, 512)
         | linear1 (512 -> head_hidden) + ReLU + linear2 (-> 128)
         v                                                   (B, 403, 128)
-    flatten + crop -> z (B, N) -> + template, activation -> (B, 1, N)
+    flatten + crop -> z (B, N) -> + template, activation -> telluric_pred (B, N)
 """
 
 from __future__ import annotations
@@ -111,7 +111,12 @@ class SpecPT(SingleFrameTelluricModel):
         self.linear1 = nn.Linear(d, config.head_hidden)
         self.linear2 = nn.Linear(config.head_hidden, self.downsample)
 
-    def reconstruct(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def reconstruct(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,     # unused: SpecPT is spectrum-only
+        wavelength: torch.Tensor | None = None,   # unused
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         b = x.size(0)
         h = x.unsqueeze(1)                                          # (B, 1, N)
         if self.pad:

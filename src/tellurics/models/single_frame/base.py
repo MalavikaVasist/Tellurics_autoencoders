@@ -1,12 +1,20 @@
-"""Shared plumbing of the single-frame telluric autoencoders.
+"""Shared plumbing of the per-observation telluric autoencoders.
 
-Every single-frame model follows the same contract::
+One observation in, one telluric spectrum out. A batch is a set of
+observations (the exposures of all nights pooled, so nights may contribute
+different numbers of frames)::
 
-    observed (B, 1, N)  --flatten-->  x (B, N)  --reconstruct()-->  z (B, N)
-    z + template (N,)   --activation-->  telluric_pred (B, 1, N)
+    observed   (B, N)  = T_tell * S
+    metadata   (B, M)  e.g. airmass, pwv
+    wavelength (B, N)  grid of observed (or (N,), shared)
+    reconstruct(x, m, wl)  -->  z (B, N)
+    z + template (N,)  --activation-->  telluric_pred (B, N)
 
 * ``reconstruct`` is the architecture (CNN / transformer / SpecPT) and returns
-  an unconstrained per-wavelength output ``z``.
+  an unconstrained per-wavelength output ``z``. The CNN and transformer
+  autoencoders join the metadata to the spectrum (as the whole-night model
+  does); the transformer also uses the wavelengths as positional encoding.
+  SpecPT uses the spectrum only.
 * ``template`` is a learned per-wavelength offset: the mean telluric
   spectrum in the activation's raw space. Telluric lines sit at fixed
   wavelengths, so this costs only ``N`` parameters and lets the network spend
@@ -16,9 +24,9 @@ Every single-frame model follows the same contract::
   gives ``T = exp(-softplus(z))`` in ``(0, 1]``.
 
 The forward signature matches :class:`~tellurics.models.multiple_frames.predictor.NeuralTelluricPredictor`
-(``stellar`` / ``metadata`` / ``time`` keywords) so the same training module
-drives every model; single-frame autoencoders use the observed spectrum only
-and ignore the other inputs.
+(``stellar`` / ``metadata`` / ``time`` / ``wavelength`` keywords) so the same
+training module drives every model. The stellar spectrum enters through
+``observed = T_tell * S`` (built by the dataset); ``time`` is unused.
 """
 
 from __future__ import annotations
@@ -34,7 +42,7 @@ __all__ = ["SingleFrameTelluricModel"]
 
 
 class SingleFrameTelluricModel(nn.Module):
-    """Base class: flatten ``(B, 1, N)`` -> ``reconstruct`` -> ``(B, 1, N)``."""
+    """Base class: one observation per row, ``(B, N)`` -> ``reconstruct`` -> ``(B, N)``."""
 
     def __init__(self, n_wavelength: int, activation: TelluricActivation | str) -> None:
         super().__init__()
@@ -47,8 +55,13 @@ class SingleFrameTelluricModel(nn.Module):
         self.template = nn.Parameter(torch.full((self.n_wavelength,), init))
 
     # -- to implement ------------------------------------------------------- #
-    def reconstruct(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(B, N) -> (z (B, N), latent (B, ...))``.
+    def reconstruct(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        wavelength: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``x (B, N), metadata (B, M), wavelength (B, N) -> (z (B, N), latent)``.
 
         ``z`` is the raw output (before template + activation); ``latent`` is
         the bottleneck code, returned as ``ModelOutput.latent``.
@@ -56,22 +69,36 @@ class SingleFrameTelluricModel(nn.Module):
         raise NotImplementedError
 
     # -- shared ------------------------------------------------------------- #
-    def flatten_input(self, observed: torch.Tensor) -> torch.Tensor:
-        """``(B, 1, N)`` or ``(B, N)`` -> ``(B, N)``."""
-        if observed.dim() == 3:
-            if observed.size(1) != 1:
-                raise ValueError(
-                    f"{type(self).__name__} is a single-frame model and expects "
-                    f"observed of shape (B, 1, N); got {tuple(observed.shape)}. "
-                    "Train it with a single-frame data module."
-                )
-            observed = observed[:, 0]
+    def check_input(self, observed: torch.Tensor) -> torch.Tensor:
+        """``observed`` must be ``(B, N)``: one observation per row."""
         if observed.dim() != 2 or observed.size(-1) != self.n_wavelength:
             raise ValueError(
-                f"expected (B, 1, {self.n_wavelength}) or (B, {self.n_wavelength}); "
-                f"got {tuple(observed.shape)}"
+                f"{type(self).__name__} takes one observation per row: expected "
+                f"observed (B, {self.n_wavelength}); got {tuple(observed.shape)}"
             )
         return observed
+
+    def check_metadata(self, metadata: torch.Tensor | None, batch: int) -> torch.Tensor | None:
+        """``metadata`` must be ``(B, M)``; ``None`` stays ``None``."""
+        if metadata is None:
+            return None
+        if metadata.dim() != 2 or metadata.size(0) != batch:
+            raise ValueError(
+                f"expected metadata ({batch}, M), one row per observation; "
+                f"got {tuple(metadata.shape)}"
+            )
+        return metadata
+
+    def check_wavelength(self, wavelength: torch.Tensor | None, batch: int) -> torch.Tensor | None:
+        """``(N,)`` or ``(B, N)`` -> ``(B, N)``; ``None`` stays ``None``."""
+        if wavelength is None:
+            return None
+        n = self.n_wavelength
+        if wavelength.dim() == 1:
+            wavelength = wavelength.expand(batch, n)
+        if wavelength.shape != (batch, n):
+            raise ValueError(f"expected wavelength ({batch}, {n}) or ({n},); got {tuple(wavelength.shape)}")
+        return wavelength
 
     def constrain(self, z: torch.Tensor) -> torch.Tensor:
         """Raw output -> transmission."""
@@ -80,24 +107,29 @@ class SingleFrameTelluricModel(nn.Module):
     def forward(
         self,
         observed: torch.Tensor,
-        stellar: torch.Tensor | None = None,     # unused (observed-only AE)
-        metadata: torch.Tensor | None = None,    # unused
+        stellar: torch.Tensor | None = None,     # unused: S is inside observed
+        metadata: torch.Tensor | None = None,    # (B, M) CNN / transformer AE
         time: torch.Tensor | None = None,        # unused
+        wavelength: torch.Tensor | None = None,  # (B, N) transformer AE
     ) -> ModelOutput:
-        """Predict the telluric transmission of single exposures.
+        """Predict one telluric spectrum per observation.
 
         Args:
-            observed: ``(B, 1, N)`` (or ``(B, N)``) observed spectra ``T * S``.
+            observed: ``(B, N)`` observed spectra ``T_tell * S``, one
+                observation per row.
+            metadata: ``(B, M)`` metadata of each observation.
+            wavelength: ``(B, N)`` (or ``(N,)``) wavelength grid of ``observed``.
 
         Returns:
-            ``ModelOutput(telluric=(B, 1, N), latent=bottleneck code)``.
+            ``ModelOutput(telluric=(B, N), latent=(B, ...))``.
         """
-        x = self.flatten_input(observed)                      # (B, N)
-        z, latent = self.reconstruct(x)                       # (B, N), (B, ...)
+        x = self.check_input(observed)                         # (B, N)
+        m = self.check_metadata(metadata, x.size(0))           # (B, M) | None
+        wl = self.check_wavelength(wavelength, x.size(0))      # (B, N) | None
+        z, latent = self.reconstruct(x, m, wl)                 # (B, N), (B, ...)
         assert z.shape == x.shape, (z.shape, x.shape)
-        telluric = self.constrain(z + self.template)          # (B, N)
         return ModelOutput(
-            telluric=telluric.unsqueeze(1),                   # (B, 1, N)
+            telluric=self.constrain(z + self.template),        # (B, N)
             latent=latent,
         )
 

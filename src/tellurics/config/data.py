@@ -2,7 +2,11 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from tellurics.config.parameters import Parameters
+from tellurics.config.parameters import (
+    METADATA_COLUMNS,
+    TARGET_COLUMNS,
+    Parameters,
+)
 from tellurics.config.paths import data_root
 
 
@@ -16,6 +20,16 @@ class DataConfig(BaseModel):
     scale_params: bool = True
     scale_time: bool = True
     param_bounds: Parameters
+    # Label columns fed to the model as metadata (order = metadata vector
+    # order). Default: pressure, temperature, humidity; the single-frame
+    # experiments use [airmass, pwv].
+    metadata_columns: list[str] = Field(
+        default_factory=lambda: list(METADATA_COLUMNS), min_length=1,
+    )
+    # Label columns returned as theta["output_params"] (analysis only, not a
+    # training target). None -> the default TARGET_COLUMNS. Every listed
+    # column must exist in the HDF5 file.
+    target_columns: list[str] | None = None
 
     pin_memory: bool = True
 
@@ -37,12 +51,30 @@ class DataConfig(BaseModel):
         self.night_h5 = self._resolve(self.night_h5)
         self.phoenix_dir = self._resolve(self.phoenix_dir)
 
+        bounded = self.param_bounds.to_mapping()
+        for group, columns in (
+            ("metadata_columns", self.metadata_columns),
+            ("target_columns", self.target_columns or []),
+        ):
+            if len(set(columns)) != len(columns):
+                raise ValueError(f"data.{group} has duplicates: {columns}")
+            missing = [c for c in columns if c not in bounded]
+            if missing:
+                raise ValueError(
+                    f"data.{group} {missing} need bounds in data.param_bounds"
+                )
+
         if self.train_fraction + self.val_fraction >= 1.0:
             raise ValueError(
                 "train_fraction + val_fraction must be less than 1"
             )
 
         return self
+
+    @property
+    def resolved_target_columns(self) -> tuple[str, ...]:
+        """``target_columns`` or the default ``TARGET_COLUMNS``."""
+        return tuple(self.target_columns) if self.target_columns else TARGET_COLUMNS
 
     def _resolve(self, path: Path) -> Path:
         path = Path(path).expanduser()

@@ -1,22 +1,34 @@
-"""Single-frame 1D-CNN autoencoder for telluric transmission.
+"""Per-observation 1D-CNN autoencoder for telluric transmission.
 
-Shape-annotated data flow (N = 51557, encoder_channels = [16, 32, 64, 96, 128],
-stride = 2, bottleneck_channels = 8, latent_dim = 128)::
+Input: the observed spectrum ``X = T_tell * S`` (the telluric transmission
+times the raw stellar spectrum, built by the dataset) and the exposure's
+metadata (``data.metadata_columns``, e.g. airmass + pwv). As in the
+whole-night model, the metadata goes through the shared
+:class:`~tellurics.models.metadata.MetadataEncoder` and its code is
+concatenated with the spectral features -- here, with the flattened conv
+features right before the bottleneck, so ``[spectrum ; metadata]`` is what is
+compressed into the latent code.
 
-    observed (B, 1, N) -> flatten -> x (B, N) -> (B, 1, N)
+Shape-annotated data flow (N = 2048, encoder_channels = [16, 32, 64, 96, 128],
+stride = 2, bottleneck_channels = 8, M = 2 metadata, metadata_enc_dim = 16,
+latent_dim = 128)::
+
+    observed (B, N) -> (B, 1, N)
         | encoder: 5 x [Conv1d(k, stride 2) + BatchNorm + GELU]
         v
-    (B, 128, 1612)
-        | 1x1 Conv squeeze -> (B, 8, 1612) -> flatten (B, 12896)
-        | Linear -> latent (B, 128)                       <- bottleneck
-        | Linear -> (B, 8 * 1612) -> reshape (B, 8, 1612)
-        | 1x1 Conv expand -> (B, 128, 1612)
+    (B, 128, 64)
+        | 1x1 Conv squeeze -> (B, 8, 64) -> flatten (B, 512)
+    metadata (B, 2) -> MetadataEncoder -> (B, 16)
+        | concat -> (B, 512 + 16)
+        | Linear -> latent (B, 128)                     <- bottleneck
+        | Linear -> (B, 8 * 64) -> reshape (B, 8, 64)
+        | 1x1 Conv expand -> (B, 128, 64)
         | decoder: 5 x [ConvTranspose1d(k, stride 2) + BatchNorm + GELU]
         v
-    (B, 16, 51584) -> crop to N -> Conv1d(k) -> z (B, N)
+    (B, 16, 2048) -> crop to N -> Conv1d(k) -> z (B, N)
         | + template, activation
         v
-    telluric_pred (B, 1, N)
+    telluric_pred (B, N)
 
 The flatten + Linear bottleneck gives every position of the decoder its own
 weights, so the decoder knows *where* on the wavelength grid it is (a purely
@@ -30,6 +42,7 @@ import torch
 import torch.nn as nn
 
 from tellurics.config.model import CNNAutoencoderConfig
+from tellurics.models.metadata import MetadataEncoder
 from tellurics.models.single_frame.base import SingleFrameTelluricModel
 from tellurics.utils.registry import ModelRegistry
 
@@ -67,11 +80,17 @@ class CNNAutoencoder(SingleFrameTelluricModel):
         self.enc_len = length                                   # e.g. 1612
         bc = config.bottleneck_channels
 
-        # ---- dense bottleneck --------------------------------------------- #
+        # ---- metadata (shared encoder, as in the whole-night model) ------- #
+        self.metadata_encoder = MetadataEncoder(
+            config.metadata_dim, config.metadata_enc_dim,
+            config.metadata_enc_hidden, dropout=config.dropout,
+        )
+
+        # ---- dense bottleneck: [conv features ; metadata code] -> latent -- #
         self.squeeze = nn.Conv1d(chans[-1], bc, kernel_size=1)
         self.to_latent = nn.Sequential(
-            nn.Flatten(), nn.Dropout(config.dropout),
-            nn.Linear(bc * self.enc_len, config.latent_dim),
+            nn.Dropout(config.dropout),
+            nn.Linear(bc * self.enc_len + config.metadata_enc_dim, config.latent_dim),
         )
         self.from_latent = nn.Sequential(
             nn.Linear(config.latent_dim, bc * self.enc_len), nn.GELU(),
@@ -94,10 +113,19 @@ class CNNAutoencoder(SingleFrameTelluricModel):
         assert self.dec_len >= self.n_wavelength, (self.dec_len, self.n_wavelength)
         self.head = nn.Conv1d(chans[0], 1, k, padding=pad)
 
-    def reconstruct(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def reconstruct(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        wavelength: torch.Tensor | None = None,     # unused by the CNN
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if metadata is None:
+            raise ValueError("CNNAutoencoder needs metadata (B, 1, M)")
         b = x.size(0)
         h = self.encoder(x.unsqueeze(1))                        # (B, C, L_enc)
-        latent = self.to_latent(self.squeeze(h))                # (B, latent_dim)
+        feats = self.squeeze(h).flatten(1)                      # (B, bc*L_enc)
+        m_code = self.metadata_encoder(metadata)                # (B, C_meta)
+        latent = self.to_latent(torch.cat([feats, m_code], dim=-1))  # (B, latent_dim)
         h = self.from_latent(latent).view(b, -1, self.enc_len)  # (B, bc, L_enc)
         h = self.decoder(self.expand(h))                        # (B, C0, L_dec)
         h = h[..., : self.n_wavelength]                         # crop to N

@@ -1,14 +1,16 @@
 # Experiment 2: single-frame 1D-CNN autoencoder
 #
-#   observed X = T*S (B, 1, N=51557) -> flatten (B, N) -> CNN AE -> telluric_pred (B, 1, N)
+#   observed X = T*S (B, N=2048)  +  metadata [airmass, pwv] (B, 2)
+#     -> CNN AE -> telluric_pred (B, N)
 #   loss = MSE(T_tell, telluric_pred)
 #
 # Model: tellurics.models.single_frame.cnn_autoencoder.CNNAutoencoder
-#   5 x strided Conv1d (/2 each) -> 1x1 squeeze -> flatten -> Linear -> latent (B, 128)
+#   5 x strided Conv1d (/2 each) -> 1x1 squeeze -> flatten (B, 512)
+#   -> concat MetadataEncoder(airmass, pwv) (B, 16) -> Linear -> latent (B, 128)
 #   -> Linear -> 5 x ConvTranspose1d (x2 each) -> crop to N -> T = exp(-tau)
 #
-# One sample = ONE exposure (the data module switches to single frames because
-# this architecture is single-frame). The split is still night-level.
+# One observation in, one telluric spectrum out. The exposures of all nights
+# are pooled into observations; a batch is (B, 2048). Night-level split.
 #
 # Run:
 #   python -m tellurics.scripts.train --config experiments/single_frame/experiment_cnn_ae.yaml
@@ -24,11 +26,14 @@ wandb:
 
 model:
   architecture: cnn_autoencoder
-  num_wavelength_bins: 51557             # spectral samples N
+  num_wavelength_bins: 2048              # spectral samples N
   encoder_channels: [16, 32, 64, 96, 128]  # strided encoder; decoder mirrors it
   kernel_size: 7                         # odd
-  stride: 2                              # 51557 -> 1612 after 5 layers
-  bottleneck_channels: 8                 # 1x1 squeeze before flatten (8 x 1612)
+  stride: 2                              # 2048 -> 64 after 5 layers
+  bottleneck_channels: 8                 # 1x1 squeeze before flatten (8 x 64 = 512)
+  metadata_dim: 2                        # = len(data.metadata_columns): airmass, pwv
+  metadata_enc_dim: 16                   # MetadataEncoder code, concatenated to the 512 conv features
+  metadata_enc_hidden: null              # MetadataEncoder hidden (null -> auto)
   latent_dim: 128                        # bottleneck code size
   dropout: 0.1
   telluric_activation: optical_depth     # T = exp(-softplus(z)) in (0, 1]  (optical_depth | sigmoid | none)
@@ -38,11 +43,17 @@ data:
   # environment (YAML does not expand variables), so this same manifest works
   # on every machine; the paths below are relative to it.
   root: "${TELLURICS_DATA}"
-  night_h5: telluric_timeseries/telluric_templates_nights.h5   # built by tests/testing_dataset_reshape.ipynb
+  # TODO: point these at the 2048-sample dataset. The HDF5 needs
+  # transmission (nights, T, 2048), wavelength (2048,) and labels with the
+  # airmass + pwv columns; the stellar pool must be on the same 2048 grid.
+  night_h5: telluric_timeseries/telluric_templates_nights.h5
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
-  scale_metadata: true                   # metadata  (pressure, temperature, humidity) -> [0,1]
+  # Metadata fed to the model (order = metadata vector order); needs bounds
+  # below and must match model.metadata_dim.
+  metadata_columns: [airmass, pwv]
+  scale_metadata: true                   # metadata (airmass, pwv) -> [0,1]
   scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
   scale_time: true                       # time_hours -> [0,1]  (time_hours / 16)
   param_bounds:
@@ -52,6 +63,7 @@ data:
     humidity: [0.0, 100.0]               # %
     angle: [0.0, 90.0]                   # deg  (zenith angle)
     airmass: [1.0, 2.0]                  # sec(z), altitude >= 30 deg
+    pwv: [0.0, 25.0]                     # mm
     co2: [420.0, 435.0]                  # ppmv
     o3: [0.018, 0.0429]                  # ppmv
     n2o: [0.335, 0.345]                  # ppmv
@@ -78,14 +90,14 @@ training:
   scheduler:
     scheduler_type: cosine               # SchedulerType enum value
     min_lr: 1e-6
-  max_epochs: 30                     # one epoch = every exposure of every training night (73 x nights)
+  max_epochs: 30                     # one epoch = every observation (exposure) of every training night
   precision: 16-mixed                    # use "32" on a CPU-only machine
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1             # accumulate gradients over this many batches before stepping the optimizer
   val_check_interval: 1.0                # epochs (or fraction) between validations
   log_every_n_steps: 10                  # Trainer logging cadence
   log_dir: logs                          # relative to run_dir (W&B local files) 
-  batch_size: 32                         # single exposures per batch
+  batch_size: 64                         # observations per batch
   num_workers: 2                         # DataLoader workers
   save_every_n_epochs: 30                # save checkpoints every N epochs (set to max_epochs to save only the final checkpoint)
   monitor_metric: validation_loss        # must match a metric the module logs

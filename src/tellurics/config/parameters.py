@@ -9,7 +9,8 @@ The field order of :class:`Parameters` defines:
 
 - ``PHYSICAL_COLUMNS``: all physical parameter names.
 - ``TARGET_COLUMNS``: parameters predicted by the model.
-- ``METADATA_COLUMNS``: parameters provided as metadata.
+- ``METADATA_COLUMNS``: default metadata columns (an experiment can pick
+  others with ``data.metadata_columns``, e.g. ``[airmass, pwv]``).
 - ``TIME_COLUMN``: the time input used by the TimeEncoder.
 
 """
@@ -26,13 +27,19 @@ __all__ = [
     "TARGET_COLUMNS",
     "METADATA_COLUMNS",
     "TIME_COLUMN",
+    "OPTIONAL_COLUMNS",
 ]
 
 # The column consumed by the TimeEncoder (never a regression target).
 TIME_COLUMN = "time_hours"
 
-# The columns consumed by the MetadataEncoder.
+# The default columns consumed by the MetadataEncoder (override per experiment
+# with ``data.metadata_columns``).
 METADATA_COLUMNS = ("pressure", "temperature", "humidity")
+
+# Columns that only some datasets carry: their bounds may be omitted, and they
+# are never part of the default ``TARGET_COLUMNS``.
+OPTIONAL_COLUMNS = ("pwv",)
 
 
 class Parameters(BaseModel):
@@ -60,13 +67,19 @@ class Parameters(BaseModel):
     no2: tuple[float, float]
     nh3: tuple[float, float]
     hno3: tuple[float, float]
+    # -- optional (only some datasets) -------------------------------------- #
+    pwv: tuple[float, float] | None = None   # precipitable water vapour, mm
 
     @field_validator("*", mode="after")
     @classmethod
     def _check_ordered_pair(
-        cls, value: tuple[float, float], info: ValidationInfo
-    ) -> tuple[float, float]:
+        cls, value: tuple[float, float] | None, info: ValidationInfo
+    ) -> tuple[float, float] | None:
         """Require finite bounds with ``min < max``."""
+        if value is None:
+            if info.field_name in OPTIONAL_COLUMNS:
+                return None
+            raise ValueError(f"{info.field_name} bounds are required")
         low, high = value
         if not (math.isfinite(low) and math.isfinite(high)):
             raise ValueError(
@@ -84,12 +97,17 @@ class Parameters(BaseModel):
         return tuple(cls.model_fields)
 
     def to_mapping(self) -> dict[str, tuple[float, float]]:
-        """Return bounds as a ``{column: (min, max)}`` mapping."""
-        return {name: tuple(getattr(self, name)) for name in self.column_names()}
+        """Return the declared bounds as a ``{column: (min, max)}`` mapping
+        (optional columns without bounds are left out)."""
+        return {
+            name: tuple(getattr(self, name))
+            for name in self.column_names()
+            if getattr(self, name) is not None
+        }
 
 
 # The schema derived from the bound declarations (canonical order preserved).
 PHYSICAL_COLUMNS: tuple[str, ...] = Parameters.column_names()
 TARGET_COLUMNS: tuple[str, ...] = tuple(
-    c for c in PHYSICAL_COLUMNS if c != TIME_COLUMN 
+    c for c in PHYSICAL_COLUMNS if c != TIME_COLUMN and c not in OPTIONAL_COLUMNS
 )

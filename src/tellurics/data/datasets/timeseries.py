@@ -79,9 +79,11 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         stellar:    (N,)     the S used to build observed
         telluric:   (T, N)   T_tell, the telluric transmission time series
                              (the model's regression target, never scaled)
+        wavelength: (N,)     the wavelength grid of the spectra (file units)
         theta: {
             "time":          (T,)
-            "metadata":      (T, 3)   pressure, temperature, humidity
+            "metadata":      (T, M)   the ``metadata_columns`` (default:
+                                      pressure, temperature, humidity)
             "output_params": (T, P)   the P telluric parameters (kept for
                                       analysis; not a training target)
         }
@@ -92,9 +94,9 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
     three are returned in ``[0, 1]`` (each group independently, according to
     which ``data.scale_*`` flags were enabled).    """
 
-    metadata_columns = METADATA_COLUMNS
+    metadata_columns: tuple[str, ...] = METADATA_COLUMNS
     time_column = TIME_COLUMN
-    target_columns = TARGET_COLUMNS
+    target_columns: tuple[str, ...] = TARGET_COLUMNS
 
     def __init__(
         self,
@@ -103,8 +105,14 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         pool: StellarPool,
         star_assignment: np.ndarray,
         scaler: ParameterScaler | None = None,
+        metadata_columns: tuple[str, ...] | list[str] | None = None,
+        target_columns: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         super().__init__()
+        if metadata_columns is not None:
+            self.metadata_columns = tuple(metadata_columns)
+        if target_columns is not None:
+            self.target_columns = tuple(target_columns)
         self.h5_path = Path(h5_path)
         self.night_ids = list(night_ids)
         self.pool = pool
@@ -127,6 +135,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         self._metadata_idx = [idx[c] for c in self.metadata_columns]
         self._target_idx = [idx[c] for c in self.target_columns]
         self._check_scaler_columns()
+        self.wavelength = self._read_wavelength()                     # (N,)
 
     def _check_scaler_columns(self) -> None:
         """Fail loudly if the scaler's column order disagrees with ours.
@@ -156,6 +165,11 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
     def _read_label_columns(self) -> list[str]:
         return read_label_columns(self.h5_path)
+
+    def _read_wavelength(self) -> torch.Tensor:
+        """The shared wavelength grid ``(N,)`` (float32, file units)."""
+        with self._open() as f:
+            return torch.from_numpy(np.asarray(f["wavelength"][:], np.float32))
 
     def __len__(self) -> int:
         return len(self.night_ids)
@@ -189,6 +203,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
             "observed": torch.from_numpy(observed),
             "stellar": torch.from_numpy(s),
             "telluric": torch.from_numpy(trans),
+            "wavelength": self.wavelength,
             "theta": {
                 "time": torch.from_numpy(time),
                 "metadata": torch.from_numpy(metadata),

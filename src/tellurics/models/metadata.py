@@ -1,4 +1,10 @@
-"""Per-exposure metadata encoder (shared MLP)."""
+"""Metadata encoder, shared by the multiple-frame and single-frame models.
+
+The whole-night model applies it per exposure ``(B, T, M) -> (B, T, C)`` and
+concatenates the code with the spectral codes; the single-frame CNN and
+transformer autoencoders apply it to their exposure ``(B, M) -> (B, C)``.
+``M = len(data.metadata_columns)`` (e.g. airmass, pwv).
+"""
 
 import torch
 import torch.nn as nn
@@ -10,7 +16,7 @@ class MetadataEncoder(nn.Module):
     """Encode per-exposure metadata scalars into a conditioning code.
 
     Maps the ``P`` scalar conditions of every exposure (e.g. airmass,
-    humidity, seeing, ...) to a ``C``-dim code with a small MLP **shared**
+    pwv, humidity, ...) to a ``C``-dim code with a small MLP **shared**
     over the ``T`` exposures (the same instance is applied to each one):
 
         metadata (B, T, P)  ->  M_code (B, T, C)

@@ -10,7 +10,7 @@ scalars, or a scalar exposure time) to a small conditioning code:
 * :class:`TimeEncoder`     - shared MLP: scalar exposure time ``(B, T) -> (B, T, k)``
 """
 
-from tellurics.models.multiple_frames.encoders.metadata import MetadataEncoder
+from tellurics.models.metadata import MetadataEncoder  # shared (models/metadata.py)
 from tellurics.models.multiple_frames.encoders.spectral import SpectralEncoder
 from tellurics.models.multiple_frames.encoders.stellar import StellarEncoder
 from tellurics.models.multiple_frames.encoders.time import TimeEncoder

@@ -54,6 +54,7 @@ data:
   night_h5: telluric_timeseries/telluric_templates_nights.h5   # built by tests/testing_dataset_reshape.ipynb
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
+  metadata_columns: [pressure, temperature, humidity]   # = model.metadata_dim (3)
   scale_metadata: true                   # metadata -> [0,1]
   scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
   scale_time: true                       # time_hours / 16 -> [0,1]

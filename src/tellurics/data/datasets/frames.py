@@ -1,19 +1,19 @@
-"""Single-frame dataset: one sample = one exposure of one night.
+"""Single-observation dataset: one sample = one exposure of one night.
 
-Used by the single-frame models (``cnn_autoencoder``, ``transformer_autoencoder``,
-``specpt``). It reads the same night-major HDF5 as
+Used by the per-observation models (``cnn_autoencoder``,
+``transformer_autoencoder``, ``specpt``): one observation in, one telluric
+spectrum out. The exposures of all nights of a split are pooled. It reads the same night-major HDF5 as
 :class:`~tellurics.data.datasets.timeseries.TelluricTimeseriesDataset` and
 keeps its whole contract (column checks, scaling, star-per-night), but indexes
 ``(night, frame)`` pairs, so the train/val/test split stays *night-level*: no
 exposure of a validation or test night is ever seen in training.
 
-Every tensor keeps a frame axis of length 1, so batches have exactly the
-shapes of the whole-night pipeline with ``T = 1``::
+A batch is a set of observations (no frame axis)::
 
-    observed (B, 1, N)   stellar (B, N)   telluric (B, 1, N)
-    theta.time (B, 1)    theta.metadata (B, 1, 3)   theta.output_params (B, 1, P)
+    observed (B, N)   stellar (B, N)   telluric (B, N)   wavelength (B, N)
+    theta.time (B,)   theta.metadata (B, M)   theta.output_params (B, P)
 
-and the same training module / loss works unchanged.
+and the same training module / loss works unchanged (MSE over (B, N)).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ __all__ = ["TelluricFrameDataset"]
 
 
 class TelluricFrameDataset(TelluricTimeseriesDataset):
-    """Single-exposure samples ``(1, N)`` drawn from whole nights.
+    """Single-observation samples ``(N,)`` drawn from whole nights.
 
     Args:
         night_ids: Nights of this split (frames of other nights never appear).
@@ -42,8 +42,8 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         n_frames: Exposures per night ``T`` (all of them become samples).
         scaler: Optional ``[0, 1]`` label scaler (as for the night dataset).
 
-    Returns the dict of :class:`TelluricTimeseriesDataset` with ``T = 1`` plus
-    ``frame_id`` (index of the exposure within its night).
+    Returns the dict of :class:`TelluricTimeseriesDataset` without the frame
+    axis, plus ``frame_id`` (index of the exposure within its night).
     """
 
     def __init__(
@@ -54,8 +54,13 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         star_assignment: np.ndarray,
         n_frames: int,
         scaler: ParameterScaler | None = None,
+        metadata_columns: tuple[str, ...] | list[str] | None = None,
+        target_columns: tuple[str, ...] | list[str] | None = None,
     ) -> None:
-        super().__init__(night_ids, h5_path, pool, star_assignment, scaler)
+        super().__init__(
+            night_ids, h5_path, pool, star_assignment, scaler,
+            metadata_columns=metadata_columns, target_columns=target_columns,
+        )
         assert n_frames > 0
         self.n_frames = int(n_frames)
 
@@ -69,13 +74,13 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         s, _ = self.pool[star_idx]                                     # (N,)
 
         with self._open() as f:
-            # keep a length-1 frame axis: (1, N) and (1, P)
+            # read as (1, N) / (1, P): the scaler works on 2-D groups
             trans = np.asarray(f["transmission"][night, frame:frame + 1], np.float32)
             lab = np.asarray(f["labels"][night, frame:frame + 1], np.float32)
 
         observed = trans * s[None, :]                                  # (1, N)
         time = lab[:, [self._time_idx]]                                # (1, 1)
-        metadata = lab[:, self._metadata_idx]                          # (1, 3)
+        metadata = lab[:, self._metadata_idx]                          # (1, M)
         output_params = lab[:, self._target_idx]                       # (1, P)
 
         if self.scaler is not None:
@@ -84,13 +89,14 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
             time = self.scaler.transform_time(time)
 
         return {
-            "observed": torch.from_numpy(observed),
-            "stellar": torch.from_numpy(s),
-            "telluric": torch.from_numpy(trans),
+            "observed": torch.from_numpy(observed[0]),                 # (N,)
+            "stellar": torch.from_numpy(s),                            # (N,)
+            "telluric": torch.from_numpy(trans[0]),                    # (N,)
+            "wavelength": self.wavelength,                             # (N,)
             "theta": {
-                "time": torch.from_numpy(time[:, 0]),                  # (1,)
-                "metadata": torch.from_numpy(metadata),
-                "output_params": torch.from_numpy(output_params),
+                "time": torch.tensor(time[0, 0], dtype=torch.float32), # ()
+                "metadata": torch.from_numpy(metadata[0]),             # (M,)
+                "output_params": torch.from_numpy(output_params[0]),   # (P,)
             },
             "night_id": night,
             "frame_id": frame,

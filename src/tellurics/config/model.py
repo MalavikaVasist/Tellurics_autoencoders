@@ -15,7 +15,9 @@ states the fields of its own model:
 =============================  ==============================  ===============
 
 ``single_frame`` (a class constant) tells the training script which dataset
-to build: whole nights ``(B, T, N)`` or single exposures ``(B, 1, N)``.
+to build: whole nights ``(B, T, N)`` for the whole-night model, or single
+observations ``(B, N)`` -- the exposures of all nights pooled -- for the
+per-observation models.
 """
 
 from enum import Enum
@@ -136,16 +138,18 @@ class ModelConfig(BaseModel):
 # Single-frame models:  observed (B, 1, N) -> flatten (B, N) -> telluric (B, 1, N)
 # =========================================================================== #
 class _SingleFrameConfig(BaseModel):
-    """Fields shared by every single-frame autoencoder.
+    """Fields shared by every per-observation autoencoder.
 
-    Single-frame models see one exposure at a time: the observed spectrum
-    ``X = T_tell * S`` of shape ``(B, 1, N)`` is flattened to ``(B, N)`` and
-    mapped to the telluric transmission ``(B, 1, N)`` of that exposure.
+    One observation in, one telluric spectrum out: the exposures of all
+    nights are pooled (nights may contribute different numbers of frames), a
+    batch is ``observed (B, N)`` + ``metadata (B, M)``, and the model returns
+    ``telluric (B, N)`` -- one spectrum per observation.
     """
 
     single_frame: ClassVar[bool] = True
 
     num_wavelength_bins: int = Field(gt=0, description="Spectral samples N.")
+
     dropout: float = Field(ge=0.0, lt=1.0)
     telluric_activation: TelluricActivation = Field(
         description="Output activation of the telluric head "
@@ -153,11 +157,31 @@ class _SingleFrameConfig(BaseModel):
     )
 
 
-class CNNAutoencoderConfig(_SingleFrameConfig):
+class _MetadataConditionedConfig(_SingleFrameConfig):
+    """Single-frame models whose input is ``observed = T * S`` + metadata.
+
+    The metadata vector (``data.metadata_columns``, e.g. airmass + pwv) is
+    encoded by the shared :class:`~tellurics.models.metadata.MetadataEncoder`
+    and joined to the spectral input, as in the whole-night model.
+    """
+
+    metadata_dim: int = Field(
+        gt=0, description="Metadata scalars per exposure M; must equal "
+                          "len(data.metadata_columns).",
+    )
+    metadata_enc_dim: int = Field(gt=0, description="MetadataEncoder code size C.")
+    metadata_enc_hidden: int | None = Field(
+        default=None, gt=0,
+        description="MetadataEncoder hidden width (None -> auto).",
+    )
+
+
+class CNNAutoencoderConfig(_MetadataConditionedConfig):
     """Single-frame 1D-CNN autoencoder (:mod:`tellurics.models.single_frame.cnn_autoencoder`).
 
-    ``(B, N) -> strided Conv1d stack -> 1x1 squeeze -> flatten -> Linear
-    -> latent (B, latent_dim) -> Linear -> ConvTranspose1d stack -> (B, N)``.
+    ``observed (B, N) -> strided Conv1d stack -> 1x1 squeeze -> flatten
+    -> concat MetadataEncoder(metadata) -> Linear -> latent (B, latent_dim)
+    -> Linear -> ConvTranspose1d stack -> telluric (B, N)``.
     """
 
     architecture: Literal[ModelArchitecture.CNN_AUTOENCODER]
@@ -173,13 +197,14 @@ class CNNAutoencoderConfig(_SingleFrameConfig):
     latent_dim: int = Field(gt=0, description="Size of the latent code.")
 
 
-class TransformerAutoencoderConfig(_SingleFrameConfig):
+class TransformerAutoencoderConfig(_MetadataConditionedConfig):
     """Single-frame transformer autoencoder (:mod:`tellurics.models.single_frame.transformer_autoencoder`).
 
-    ``(B, N) -> patches (B, n_patches, patch_size) -> Linear + pos-emb
+    ``observed (B, N) -> patches (B, n_patches, patch_size) -> Linear
+    + wavelength positional encoding -> [patch tokens ; metadata token]
     -> TransformerEncoder -> cross-attention onto num_latents learned queries
-    (bottleneck: num_latents x latent_dim) -> TransformerDecoder from learned
-    per-patch queries -> Linear -> (B, N)``.
+    (bottleneck: num_latents x latent_dim) -> TransformerDecoder from
+    wavelength-encoded per-patch queries -> Linear -> telluric (B, N)``.
     """
 
     architecture: Literal[ModelArchitecture.TRANSFORMER_AUTOENCODER]
@@ -191,6 +216,11 @@ class TransformerAutoencoderConfig(_SingleFrameConfig):
     dim_feedforward: int = Field(gt=0)
     num_latents: int = Field(gt=0, description="Learned bottleneck tokens.")
     latent_dim: int = Field(gt=0, description="Width of each bottleneck token.")
+    wavelength_frequencies: int = Field(
+        gt=0, description="Fourier frequencies of the wavelength positional "
+                          "encoding (sin/cos of 2^k * pi * lambda_norm, "
+                          "k = 0..F-1, for every sample of a patch).",
+    )
 
 
 class SpecPTConfig(_SingleFrameConfig):

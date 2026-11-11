@@ -6,9 +6,9 @@ Four experiments share this script; each has its own manifest and the
 ``model.architecture`` value selects both the model and the sample type:
 
     experiments/multiple_frames/experiment.yaml               neural_telluric_predictor  (B, T, N)
-    experiments/single_frame/experiment_cnn_ae.yaml           cnn_autoencoder            (B, 1, N)
-    experiments/single_frame/experiment_transformer_ae.yaml   transformer_autoencoder    (B, 1, N)
-    experiments/single_frame/experiment_specpt.yaml           specpt                     (B, 1, N)
+    experiments/single_frame/experiment_cnn_ae.yaml           cnn_autoencoder            (B, N) -> (B, N)
+    experiments/single_frame/experiment_transformer_ae.yaml   transformer_autoencoder    (B, N) -> (B, N)
+    experiments/single_frame/experiment_specpt.yaml           specpt                     (B, N) -> (B, N)
 
 The manifest folders mirror ``tellurics.models``: ``multiple_frames/`` for the
 whole-night model, ``single_frame/`` for the single-exposure autoencoders.
@@ -21,9 +21,9 @@ Pipeline
 2. TelluricDataModule pairs each night with a fixed, seeded PHOENIX stellar
    spectrum and serves either whole nights or, for single-frame models,
    single exposures (night-level split either way):
-   - observed spectra: (B, T, N)  or (B, 1, N)
+   - observed spectra: (B, T, N)  or single observations (B, N)
    - stellar spectra: (B, N)
-   - telluric transmission (target): (B, T, N)  or (B, 1, N)
+   - telluric transmission (target): (B, T, N)  or (B, N)
    - theta: time, atmospheric metadata (pressure, temperature, humidity)
      as inputs, plus the 16 telluric parameters (not used in the loss).
 
@@ -188,8 +188,8 @@ def build_model(
     """Build the LightningModule (registry-resolved estimator) to train.
     """
     frames = (
-        "single frame (T=1)" if model_config.single_frame
-        else f"T={model_config.n_frames_per_series}"
+        "single observations (B, N) -> (B, N)" if model_config.single_frame
+        else f"whole nights, T={model_config.n_frames_per_series}"
     )
     logger.info(
         f"Training {model_config.architecture.value} | "
@@ -333,8 +333,9 @@ def main() -> None:
     config = apply_overrides(config, args.overrides)
 
     run_dir = prepare_run_dir(config)
-    # Single-frame models train on single exposures (B, 1, N); the whole-night
-    # model on whole nights (B, T, N). Decided by the model config alone.
+    # The whole-night model trains on whole nights (B, T, N); the
+    # per-observation autoencoders on single observations (B, N), the
+    # exposures of all nights pooled. Decided by the model config alone.
     datamodule = build_datamodule(
         config.data, config.training, run_dir,
         single_frame=config.model.single_frame,

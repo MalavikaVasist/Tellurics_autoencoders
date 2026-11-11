@@ -66,6 +66,7 @@ data:
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
+  metadata_columns: [pressure, temperature, humidity]   # = model.metadata_dim (3)
   scale_metadata: true                   # metadata  (pressure, temperature, humidity) -> [0,1]
   scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
   scale_time: true                       # time_hours -> [0,1]  (time_hours / 16)

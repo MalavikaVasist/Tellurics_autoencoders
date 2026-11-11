@@ -4,7 +4,12 @@ For the code to run,
 2. run testing_dataset_reshape.ipynb to reshape the dataset.
 3. Then you can run python -m tellurics.scripts.train --config experiments/multiple_frames/experiment.yaml --device gpu
    (single-frame models: experiments/single_frame/experiment_{cnn_ae,transformer_ae,specpt}.yaml)
-4. sweep across parameters, 
+4. architecture sweeps (dawgz, Slurm), one script per architecture:
+     python -m src.tellurics.scripts.sweep_cnn_ae                  # CNN autoencoder
+     python -m src.tellurics.scripts.sweep_transformer_ae          # transformer autoencoder
+   each with --dry-run (print commands) and --summarize (rank finished trials
+   by validation_loss); search spaces at the top of each script.
+5. sweep across parameters of the whole-night model (src/tellurics/scripts/sweep.py),
 spectral_latent_dim
 metadata_enc_dim
 time_enc_dim

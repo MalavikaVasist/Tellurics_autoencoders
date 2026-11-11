@@ -246,6 +246,7 @@ class NeuralTelluricPredictor(nn.Module):
         stellar: torch.Tensor | None = None,
         metadata: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
+        wavelength: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Predict the whole-night telluric transmission time series.
 
@@ -260,6 +261,8 @@ class NeuralTelluricPredictor(nn.Module):
             time: (B, T) continuous exposure times (e.g. ``time_hours`` from
                 the data), used to build the per-exposure time code ``z_time``.
                 ``None`` is not supported.
+            wavelength: accepted for interface compatibility; unused (the
+                spectral CNNs see the fixed grid implicitly).
 
         Returns:
             ModelOutput(telluric=(B, T, N), latent=(B, Q*d),
