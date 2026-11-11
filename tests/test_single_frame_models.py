@@ -31,6 +31,7 @@ from tellurics.config import (
     TransformerAutoencoderConfig,
     load_config,
 )
+from tellurics.config.data import DataConfig
 from tellurics.config.training import TrainingConfig
 from tellurics.data.datasets import TelluricFrameDataset, TelluricTimeseriesDataset
 from tellurics.models import CNNAutoencoder, SpecPT, TransformerAutoencoder
@@ -418,3 +419,233 @@ def _tiny_for_n_wave(arch: str):
     if arch == "transformer_autoencoder":
         return _tae(N_WAVE, patch_size=2)
     return _specpt(N_WAVE, stem_channels=[4], stem_kernels=[3], token_stride=1)
+
+
+# --------------------------------------------------------------------------- #
+# Flat HDF5 layout: one row per observation, any number of frames per night
+# --------------------------------------------------------------------------- #
+FLAT_FRAMES = {10: 3, 20: 5, 30: 1}      # series_index -> frames (unequal on purpose)
+
+
+class _DistinctStars:
+    """Pool whose star k is the constant spectrum k + 1 (identifiable)."""
+
+    def __getitem__(self, index: int):
+        return np.full(N_WAVE, index + 1.0, np.float32), None
+
+    def __len__(self) -> int:
+        return 5
+
+
+def _write_flat_file(path, frames=FLAT_FRAMES, nan_row: int | None = None) -> None:
+    """transmission (n_obs, N), labels (n_obs, P) with series_index; rows shuffled."""
+    import h5py
+    from tellurics.config.parameters import PHYSICAL_COLUMNS
+
+    columns = ["flat_index", "series_index", "frame_index", *PHYSICAL_COLUMNS]
+    rows = [(sid, k) for sid, n in frames.items() for k in range(n)]
+    rows = [rows[i] for i in np.random.default_rng(0).permutation(len(rows))]
+    labels = np.zeros((len(rows), len(columns)), np.float32)
+    trans = np.zeros((len(rows), N_WAVE), np.float32)
+    for r, (sid, k) in enumerate(rows):
+        labels[r, columns.index("flat_index")] = r
+        labels[r, columns.index("series_index")] = sid
+        labels[r, columns.index("frame_index")] = k
+        labels[r, columns.index("airmass")] = 1.0 + 0.1 * k
+        labels[r, columns.index("pwv")] = sid / 10.0
+        trans[r] = 0.5 + 0.01 * sid + 0.001 * k          # identifiable per row
+    if nan_row is not None:
+        trans[nan_row, 0] = np.nan
+    with h5py.File(path, "w") as f:
+        f.create_dataset("transmission", data=trans)
+        f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N_WAVE))
+        f.create_dataset("labels", data=labels).attrs["columns"] = np.array(columns, dtype="S")
+
+
+def _flat_datamodule(path, tmp_path, single_frame=True):
+    from tellurics.data.datamodule import TelluricDataModule
+    from tests._bounds import BOUNDS
+
+    config = DataConfig(
+        night_h5=path, param_bounds={**BOUNDS, "pwv": (0.0, 25.0)},
+        metadata_columns=["airmass", "pwv"],
+    )
+    module = TelluricDataModule(config, run_dir=tmp_path, single_frame=single_frame)
+    module._load_metadata()
+    return module
+
+
+class TestFlatLayout:
+    def test_nights_are_grouped_by_series_with_their_own_frame_counts(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        dm = _flat_datamodule(path, tmp_path)
+        assert dm.n_nights == 3
+        assert list(dm.night_series) == [10, 20, 30]
+        assert [len(dm.night_rows[i]) for i in range(3)] == [3, 5, 1]   # no padding
+
+    def test_every_real_observation_once_with_one_star_per_night(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        dm = _flat_datamodule(path, tmp_path)
+        stars = np.array([2, 0, 4])                      # star per night
+        ds = TelluricFrameDataset(
+            night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
+            star_assignment=stars, night_rows=dm.night_rows,
+            metadata_columns=("airmass", "pwv"),
+        )
+        assert len(ds) == sum(FLAT_FRAMES.values())      # 9 observations
+        seen = {}
+        for i in range(len(ds)):
+            x = ds[i]
+            assert x["observed"].shape == (N_WAVE,)
+            assert torch.isfinite(x["observed"]).all()
+            # the night's star, for every one of its frames
+            assert torch.allclose(x["stellar"], torch.full((N_WAVE,), stars[x["night_id"]] + 1.0))
+            assert torch.allclose(x["observed"], x["telluric"] * x["stellar"])
+            # pwv label = series / 10: the row really belongs to that night
+            assert float(x["theta"]["metadata"][1]) == pytest.approx(
+                dm.night_series[x["night_id"]] / 10.0)
+            seen.setdefault(x["night_id"], set()).add(x["frame_id"])
+        assert {k: len(v) for k, v in seen.items()} == {0: 3, 1: 5, 2: 1}
+
+    def test_split_subset_only_serves_its_nights(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        dm = _flat_datamodule(path, tmp_path)
+        ds = TelluricFrameDataset(
+            night_ids=[1], h5_path=path, pool=_DistinctStars(),
+            star_assignment=np.zeros(3, int), night_rows=dm.night_rows,
+            metadata_columns=("airmass", "pwv"),
+        )
+        assert len(ds) == 5 and {ds[i]["night_id"] for i in range(5)} == {1}
+
+    def test_whole_night_model_refuses_a_flat_file(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        with pytest.raises(ValueError, match="flat"):
+            _flat_datamodule(path, tmp_path, single_frame=False)
+
+    def test_flat_file_needs_series_index(self, tmp_path) -> None:
+        import h5py
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        with h5py.File(path, "a") as f:
+            cols = [c.decode() for c in f["labels"].attrs["columns"]]
+            cols[cols.index("series_index")] = "series"
+            f["labels"].attrs["columns"] = np.array(cols, dtype="S")
+        with pytest.raises(KeyError, match="series_index"):
+            _flat_datamodule(path, tmp_path)
+
+    def test_non_finite_observation_raises_instead_of_reaching_the_network(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path, nan_row=4)
+        dm = _flat_datamodule(path, tmp_path)
+        ds = TelluricFrameDataset(
+            night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
+            star_assignment=np.zeros(3, int), night_rows=dm.night_rows,
+            metadata_columns=("airmass", "pwv"),
+        )
+        with pytest.raises(ValueError, match="non-finite"):
+            for i in range(len(ds)):
+                ds[i]
+
+    def test_lightning_step_on_a_flat_file(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        dm = _flat_datamodule(path, tmp_path)
+        ds = TelluricFrameDataset(
+            night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
+            star_assignment=np.zeros(3, int), night_rows=dm.night_rows,
+            metadata_columns=("airmass", "pwv"),
+        )
+        loader = DataLoader(ds, batch_size=4)
+        module = TelluricTrainingModule(
+            _tiny_for_n_wave("cnn_autoencoder"), TrainingConfig(max_epochs=1, precision="32"),
+        )
+        trainer = pl.Trainer(
+            fast_dev_run=True, logger=False, enable_checkpointing=False,
+            enable_progress_bar=False, enable_model_summary=False,
+            accelerator="cpu", devices=1,
+        )
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        assert trainer.state.status == "finished"
+
+
+# --------------------------------------------------------------------------- #
+# No telluric parameters / no time column (read from the YAML)
+# --------------------------------------------------------------------------- #
+def _write_minimal_flat_file(path, frames=FLAT_FRAMES) -> None:
+    """Labels hold only series_index, airmass, pwv: no parameters, no time."""
+    import h5py
+
+    columns = ["series_index", "airmass", "pwv"]
+    rows = [(sid, k) for sid, n in frames.items() for k in range(n)]
+    labels = np.array([[sid, 1.0 + 0.1 * k, sid / 10.0] for sid, k in rows], np.float32)
+    trans = np.array([np.full(N_WAVE, 0.5 + 0.01 * sid + 0.001 * k) for sid, k in rows], np.float32)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("transmission", data=trans)
+        f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N_WAVE))
+        f.create_dataset("labels", data=labels).attrs["columns"] = np.array(columns, dtype="S")
+
+
+class TestNoParameters:
+    @pytest.mark.parametrize(
+        "fname", ["experiment_cnn_ae.yaml", "experiment_transformer_ae.yaml",
+                  "experiment_specpt.yaml"],
+    )
+    def test_single_frame_manifests_read_no_parameters_and_no_time(self, fname) -> None:
+        data = load_config(REPO / "experiments" / "single_frame" / fname).data
+        assert data.target_columns == [] and data.resolved_target_columns == ()
+        assert data.time_column is None
+
+    def test_whole_night_manifest_keeps_parameters_and_time(self) -> None:
+        data = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml").data
+        assert data.target_columns is None and len(data.resolved_target_columns) == 16
+        assert data.time_column == "time_hours"
+
+    def test_whole_night_model_requires_a_time_column(self) -> None:
+        raw = load_config(
+            REPO / "experiments" / "multiple_frames" / "experiment.yaml"
+        ).model_dump(mode="json")
+        raw["data"]["time_column"] = None
+        with pytest.raises(ValidationError, match="time_column"):
+            ExperimentConfig(**raw)
+
+    def test_minimal_file_loads_scales_and_trains(self, tmp_path) -> None:
+        from tellurics.data.datamodule import build_scaler
+        from tests._bounds import BOUNDS
+
+        path = tmp_path / "minimal.h5"
+        _write_minimal_flat_file(path)
+        config = DataConfig(
+            night_h5=path, param_bounds={**BOUNDS, "pwv": (0.0, 25.0)},
+            metadata_columns=["airmass", "pwv"], target_columns=[], time_column=None,
+        )
+        from tellurics.data.datamodule import TelluricDataModule
+        dm = TelluricDataModule(config, run_dir=tmp_path, single_frame=True)
+        dm._load_metadata()
+        scaler = build_scaler(config)
+        assert scaler.params is None and scaler.time is None and scaler.metadata is not None
+        ds = TelluricFrameDataset(
+            night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
+            star_assignment=np.array([0, 1, 2]), night_rows=dm.night_rows, scaler=scaler,
+            metadata_columns=("airmass", "pwv"), target_columns=(), time_column=None,
+        )
+        x = ds[0]
+        assert x["theta"]["output_params"].shape == (0,)
+        assert float(x["theta"]["time"]) == 0.0
+        m = x["theta"]["metadata"]
+        assert m.shape == (2,) and bool(((m >= 0) & (m <= 1)).all())     # scaled to [0, 1]
+
+        loader = DataLoader(ds, batch_size=4)
+        module = TelluricTrainingModule(
+            _tiny_for_n_wave("cnn_autoencoder"), TrainingConfig(max_epochs=1, precision="32"),
+        )
+        trainer = pl.Trainer(
+            fast_dev_run=True, logger=False, enable_checkpointing=False,
+            enable_progress_bar=False, enable_model_summary=False,
+            accelerator="cpu", devices=1,
+        )
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        assert trainer.state.status == "finished"

@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from tellurics.config.parameters import (
     METADATA_COLUMNS,
     TARGET_COLUMNS,
+    TIME_COLUMN,
     Parameters,
 )
 from tellurics.config.paths import data_root
@@ -27,9 +28,14 @@ class DataConfig(BaseModel):
         default_factory=lambda: list(METADATA_COLUMNS), min_length=1,
     )
     # Label columns returned as theta["output_params"] (analysis only, not a
-    # training target). None -> the default TARGET_COLUMNS. Every listed
-    # column must exist in the HDF5 file.
+    # training target). None -> the default TARGET_COLUMNS; [] -> no
+    # parameter columns at all (none are read or required in the file).
+    # Every listed column must exist in the HDF5 file.
     target_columns: list[str] | None = None
+    # Label column fed to the whole-night model's TimeEncoder. null -> no time
+    # column is read or required (theta["time"] is zeros); the per-observation
+    # autoencoders do not use time.
+    time_column: str | None = TIME_COLUMN
 
     pin_memory: bool = True
 
@@ -55,6 +61,7 @@ class DataConfig(BaseModel):
         for group, columns in (
             ("metadata_columns", self.metadata_columns),
             ("target_columns", self.target_columns or []),
+            ("time_column", [self.time_column] if self.time_column else []),
         ):
             if len(set(columns)) != len(columns):
                 raise ValueError(f"data.{group} has duplicates: {columns}")
@@ -73,8 +80,8 @@ class DataConfig(BaseModel):
 
     @property
     def resolved_target_columns(self) -> tuple[str, ...]:
-        """``target_columns`` or the default ``TARGET_COLUMNS``."""
-        return tuple(self.target_columns) if self.target_columns else TARGET_COLUMNS
+        """``target_columns`` (may be empty) or, if unset, ``TARGET_COLUMNS``."""
+        return TARGET_COLUMNS if self.target_columns is None else tuple(self.target_columns)
 
     def _resolve(self, path: Path) -> Path:
         path = Path(path).expanduser()

@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from tellurics.config.data import DataConfig
 from tellurics.data.datasets.frames import TelluricFrameDataset
 from tellurics.data.datasets.timeseries import (
+    read_label_columns,
     METADATA_COLUMNS,
     TARGET_COLUMNS,
     TIME_COLUMN,
@@ -62,7 +63,7 @@ def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
         config.param_bounds.to_mapping(),
         metadata_columns=tuple(config.metadata_columns),
         target_columns=config.resolved_target_columns,
-        time_column=TIME_COLUMN,
+        time_column=config.time_column,
         scale_metadata=config.scale_metadata,
         scale_params=config.scale_params,
         scale_time=config.scale_time,
@@ -108,7 +109,9 @@ class TelluricDataModule(pl.LightningDataModule):
     stellar_assignment: np.ndarray | None = None      # (n_nights,) star indices
     scaler: ParameterScaler | None = None             # [0,1] label scaling
     n_nights: int = 0
-    n_frames: int = 0
+    n_frames: int = 0                                 # night-major layout only
+    night_rows: dict[int, np.ndarray] | None = None   # flat layout: night -> rows
+    night_series: np.ndarray | None = None            # flat layout: night -> series_index
     train_ids: list[int] = []
     val_ids: list[int] = []
     test_ids: list[int] = []
@@ -142,8 +145,28 @@ class TelluricDataModule(pl.LightningDataModule):
         import h5py
 
         with h5py.File(night_h5, "r") as f:
-            available_nights = int(f["transmission"].shape[0])
-            self.n_frames = int(f["transmission"].shape[1])
+            flat = f["transmission"].ndim == 2
+            if flat:
+                # Flat layout: one row per observation; nights are the distinct
+                # series_index values and may have different numbers of frames.
+                columns = read_label_columns(night_h5)
+                if "series_index" not in columns:
+                    raise KeyError(
+                        f"flat HDF5 {night_h5} needs a 'series_index' label column "
+                        f"to group observations into nights; columns: {columns}"
+                    )
+                series = np.asarray(
+                    f["labels"][:, columns.index("series_index")]
+                ).astype(np.int64)
+                ids, inverse = np.unique(series, return_inverse=True)
+                order = np.argsort(inverse, kind="stable")
+                bounds = np.cumsum(np.bincount(inverse, minlength=len(ids)))[:-1]
+                rows = np.split(order, bounds)
+                available_nights = len(ids)
+                self.night_series = ids          # night position -> series_index
+            else:
+                available_nights = int(f["transmission"].shape[0])
+                self.n_frames = int(f["transmission"].shape[1])
             wl = np.asarray(f["wavelength"][:], np.float64)
             unit = str(f["wavelength"].attrs.get("unit", "nm"))
 
@@ -159,9 +182,24 @@ class TelluricDataModule(pl.LightningDataModule):
             )
 
         self.wavegrid = Wavegrid(wavelength=wl, unit=unit)
-        logger.info(
-            f"{self.n_nights} nights x {self.n_frames} frames from {night_h5}"
-        )
+        if flat:
+            if not self.single_frame:
+                raise ValueError(
+                    f"{night_h5} is flat (one row per observation): only the "
+                    "single-frame models can use it; the whole-night model "
+                    "needs the night-major (n_nights, T, N) layout"
+                )
+            self.night_rows = {i: rows[i] for i in range(self.n_nights)}
+            counts = np.array([len(rows[i]) for i in range(self.n_nights)])
+            logger.info(
+                f"{self.n_nights} nights, {counts.sum()} observations "
+                f"({counts.min()}-{counts.max()} frames per night) from "
+                f"flat {night_h5}"
+            )
+        else:
+            logger.info(
+                f"{self.n_nights} nights x {self.n_frames} frames from {night_h5}"
+            )
 
 
     def _make_scaler(self) -> None:
@@ -200,6 +238,10 @@ class TelluricDataModule(pl.LightningDataModule):
             self.stellar_pool,
             {"train": self.train_ids, "val": self.val_ids, "test": self.test_ids},
             audit_csv,
+            series=(
+                None if self.night_series is None
+                else self.night_series[: self.n_nights]
+            ),
         )
         logger.info(
             f"train {len(self.train_ids)} / val {len(self.val_ids)} / "
@@ -221,15 +263,19 @@ class TelluricDataModule(pl.LightningDataModule):
             star_assignment=self.stellar_assignment,
             metadata_columns=tuple(self.config.metadata_columns),
             target_columns=self.config.resolved_target_columns,
+            time_column=self.config.time_column,
         )
         logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
         dataset_cls = TelluricTimeseriesDataset
         if self.single_frame:
             dataset_cls = TelluricFrameDataset
-            common["n_frames"] = self.n_frames
-            logger.info(
-                f"single-frame samples: {self.n_frames} exposures per night"
-            )
+            if self.night_rows is not None:
+                common["night_rows"] = self.night_rows      # flat: any frames per night
+            else:
+                common["n_frames"] = self.n_frames
+                logger.info(
+                    f"single-frame samples: {self.n_frames} exposures per night"
+                )
         test_scaler = (
             None if self.scaler is None else build_scaler(self.config, clip=True)
         )

@@ -95,7 +95,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
     which ``data.scale_*`` flags were enabled).    """
 
     metadata_columns: tuple[str, ...] = METADATA_COLUMNS
-    time_column = TIME_COLUMN
+    time_column: str | None = TIME_COLUMN
     target_columns: tuple[str, ...] = TARGET_COLUMNS
 
     def __init__(
@@ -107,12 +107,14 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         scaler: ParameterScaler | None = None,
         metadata_columns: tuple[str, ...] | list[str] | None = None,
         target_columns: tuple[str, ...] | list[str] | None = None,
+        time_column: str | None = TIME_COLUMN,
     ) -> None:
         super().__init__()
         if metadata_columns is not None:
             self.metadata_columns = tuple(metadata_columns)
         if target_columns is not None:
-            self.target_columns = tuple(target_columns)
+            self.target_columns = tuple(target_columns)     # () -> no parameters
+        self.time_column = time_column                      # None -> no time column
         self.h5_path = Path(h5_path)
         self.night_ids = list(night_ids)
         self.pool = pool
@@ -123,7 +125,8 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         # Single source of truth, so the indices can never disagree with the
         # data they index into.
         self._label_columns = self._read_label_columns()
-        for expected in (*self.metadata_columns, self.time_column,
+        time_cols = (self.time_column,) if self.time_column else ()
+        for expected in (*self.metadata_columns, *time_cols,
                          *self.target_columns):
             if expected not in self._label_columns:
                 raise KeyError(
@@ -131,7 +134,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
                     f"{self._label_columns}"
                 )
         idx = {c: self._label_columns.index(c) for c in self._label_columns}
-        self._time_idx = idx[self.time_column]
+        self._time_idx = idx[self.time_column] if self.time_column else None
         self._metadata_idx = [idx[c] for c in self.metadata_columns]
         self._target_idx = [idx[c] for c in self.target_columns]
         self._check_scaler_columns()
@@ -148,7 +151,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         expected = {
             "metadata": tuple(self.metadata_columns),
             "params": tuple(self.target_columns),
-            "time": (self.time_column,),
+            "time": (self.time_column,) if self.time_column else (),
         }
         for group_name, columns in expected.items():
             group = getattr(self.scaler, group_name)
@@ -188,7 +191,10 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
         # Slice ``time_hours`` as (T, 1) so every group handed to the scaler is
         # 2-D ``(T, P)``; it is squeezed back to (T,) for the model afterwards.
-        time = lab[:, [self._time_idx]]                                 # (T, 1)
+        time = (
+            lab[:, [self._time_idx]] if self._time_idx is not None
+            else np.zeros((lab.shape[0], 1), np.float32)                # no time column
+        )                                                               # (T, 1)
         metadata = lab[:, self._metadata_idx]                           # (T, 3)
         output_params = lab[:, self._target_idx]                        # (T, P)
 

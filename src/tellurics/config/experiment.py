@@ -53,6 +53,16 @@ class ExperimentConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _whole_night_model_needs_time(self) -> "ExperimentConfig":
+        """The whole-night model's TimeEncoder needs ``data.time_column``."""
+        if not self.model.single_frame and self.data.time_column is None:
+            raise ValueError(
+                f"model {self.model.architecture.value} uses exposure times: "
+                "set data.time_column (e.g. time_hours)"
+            )
+        return self
+
 
 def load_config(path: str | Path | None) -> ExperimentConfig:
     """

@@ -58,9 +58,14 @@ data:
   # Metadata fed to the model (order = metadata vector order); needs bounds
   # below and must match model.metadata_dim.
   metadata_columns: [airmass, pwv]
+  # No telluric parameters here: no parameter columns are read or required
+  # (theta.output_params is empty), and no time column (the per-observation
+  # models do not use time).
+  target_columns: []
+  time_column: null
   scale_metadata: true                   # metadata (airmass, pwv) -> [0,1]
-  scale_params: true                     # theta.output_params -> [0,1] (not a training target any more)
-  scale_time: true                       # time_hours -> [0,1]  (time_hours / 16)
+  scale_params: true                     # no effect: target_columns is empty
+  scale_time: true                       # no effect: time_column is null
   param_bounds:
     time_hours: [0.0, 6.0]              # h    
     pressure: [600.0, 850.0]             # hPa

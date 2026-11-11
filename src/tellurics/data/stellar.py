@@ -128,9 +128,11 @@ def save_stellar_assignment(
     pool: StellarPool,
     splits: dict[str, list[int]] | None,
     out_csv: str | Path,
+    series: np.ndarray | None = None,
 ) -> None:
     """Write ``night_id, split, star_index, star_file`` so the used stars are
-    auditable per night and per split."""
+    auditable per night and per split. With ``series`` (flat HDF5 layout) a
+    ``series_index`` column maps each night to its series in the file."""
     import csv
 
     out_csv = Path(out_csv)
@@ -142,9 +144,11 @@ def save_stellar_assignment(
                 split_of[int(nid)] = split
     with open(out_csv, "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["night_id", "split", "star_index", "star_file"])
+        header = ["night_id", "split", "star_index", "star_file"]
+        writer.writerow(header + (["series_index"] if series is not None else []))
         for night in range(assignment.size):
             sidx = int(assignment[night])
-            writer.writerow(
-                [night, split_of.get(int(night), ""), sidx, pool.names[sidx]]
-            )
+            row = [night, split_of.get(int(night), ""), sidx, pool.names[sidx]]
+            if series is not None:
+                row.append(int(series[night]))
+            writer.writerow(row)
