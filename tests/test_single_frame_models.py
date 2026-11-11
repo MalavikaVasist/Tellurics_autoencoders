@@ -135,7 +135,8 @@ class TestConfigs:
         cfg = load_config(REPO / "experiments" / fname)
         assert cfg.data.metadata_columns == ["airmass", "pwv"]
         assert cfg.model.metadata_dim == 2
-        assert cfg.data.param_bounds.pwv is not None
+        assert cfg.data.param_bounds is None
+        assert cfg.data.metadata_bounds == {"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)}
 
     def test_whole_night_keeps_its_three_metadata_columns(self) -> None:
         cfg = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml")
@@ -154,9 +155,31 @@ class TestConfigs:
         raw = load_config(
             REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
         ).model_dump(mode="json")
-        raw["data"]["param_bounds"].pop("pwv")
+        raw["data"]["metadata_bounds"].pop("pwv")
         with pytest.raises(ValidationError, match="pwv"):
             ExperimentConfig(**raw)
+
+    def test_exactly_one_bounds_block(self) -> None:
+        raw = load_config(
+            REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
+        ).model_dump(mode="json")
+        raw["data"]["metadata_bounds"] = None
+        with pytest.raises(ValidationError, match="exactly one"):
+            ExperimentConfig(**raw)
+
+    def test_metadata_bounds_must_be_ordered(self) -> None:
+        raw = load_config(
+            REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
+        ).model_dump(mode="json")
+        raw["data"]["metadata_bounds"]["pwv"] = [25.0, 0.0]
+        with pytest.raises(ValidationError, match="min < max"):
+            ExperimentConfig(**raw)
+
+    def test_set_overrides_still_work_on_single_frame_configs(self) -> None:
+        from tellurics.scripts.train import apply_overrides
+        cfg = load_config(REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml")
+        cfg = apply_overrides(cfg, ["model.latent_dim=64", "training.batch_size=16"])
+        assert cfg.model.latent_dim == 64 and cfg.data.param_bounds is None
 
     def test_manifest_folders_mirror_the_model_packages(self) -> None:
         """multiple_frames/ -> whole-night model, single_frame/ -> per-frame models."""
@@ -596,13 +619,14 @@ class TestNoParameters:
     )
     def test_single_frame_manifests_read_no_parameters_and_no_time(self, fname) -> None:
         data = load_config(REPO / "experiments" / "single_frame" / fname).data
-        assert data.target_columns == [] and data.resolved_target_columns == ()
-        assert data.time_column is None
+        assert data.param_bounds is None
+        assert data.resolved_target_columns == () and data.resolved_time_column is None
+        assert set(data.bounds) == {"airmass", "pwv"}
 
     def test_whole_night_manifest_keeps_parameters_and_time(self) -> None:
         data = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml").data
-        assert data.target_columns is None and len(data.resolved_target_columns) == 16
-        assert data.time_column == "time_hours"
+        assert data.param_bounds is not None and len(data.resolved_target_columns) == 16
+        assert data.resolved_time_column == "time_hours"
 
     def test_whole_night_model_requires_a_time_column(self) -> None:
         raw = load_config(
@@ -610,6 +634,12 @@ class TestNoParameters:
         ).model_dump(mode="json")
         raw["data"]["time_column"] = None
         with pytest.raises(ValidationError, match="time_column"):
+            ExperimentConfig(**raw)
+        raw["data"]["time_column"] = "time_hours"                 # metadata-only bounds
+        raw["data"]["param_bounds"] = None
+        raw["data"]["metadata_bounds"] = {"pressure": [600, 850], "temperature": [233, 318],
+                                          "humidity": [0, 100]}
+        with pytest.raises(ValidationError, match="time"):
             ExperimentConfig(**raw)
 
     def test_minimal_file_loads_scales_and_trains(self, tmp_path) -> None:
@@ -619,8 +649,8 @@ class TestNoParameters:
         path = tmp_path / "minimal.h5"
         _write_minimal_flat_file(path)
         config = DataConfig(
-            night_h5=path, param_bounds={**BOUNDS, "pwv": (0.0, 25.0)},
-            metadata_columns=["airmass", "pwv"], target_columns=[], time_column=None,
+            night_h5=path, metadata_columns=["airmass", "pwv"],
+            metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)},
         )
         from tellurics.data.datamodule import TelluricDataModule
         dm = TelluricDataModule(config, run_dir=tmp_path, single_frame=True)
@@ -630,11 +660,12 @@ class TestNoParameters:
         ds = TelluricFrameDataset(
             night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
             star_assignment=np.array([0, 1, 2]), night_rows=dm.night_rows, scaler=scaler,
-            metadata_columns=("airmass", "pwv"), target_columns=(), time_column=None,
+            metadata_columns=("airmass", "pwv"),
+            target_columns=config.resolved_target_columns,
+            time_column=config.resolved_time_column,
         )
         x = ds[0]
-        assert x["theta"]["output_params"].shape == (0,)
-        assert float(x["theta"]["time"]) == 0.0
+        assert set(x["theta"]) == {"metadata"}            # no time, no parameters
         m = x["theta"]["metadata"]
         assert m.shape == (2,) and bool(((m >= 0) & (m <= 1)).all())     # scaled to [0, 1]
 

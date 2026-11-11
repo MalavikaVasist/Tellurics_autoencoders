@@ -45,7 +45,8 @@ logger = get_logger(__name__)
 def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
     """Build the ``[0, 1]`` label scaler described by a ``data:`` section.
 
-    A pure function of ``data.param_bounds`` and the three ``data.scale_*``
+    A pure function of the declared bounds (``data.param_bounds`` or
+    ``data.metadata_bounds``) and the ``data.scale_*``
     flags: no statistic is read off the data and no split is involved, so the
     scaler is identical for train/val/test and can be rebuilt from a run's
     ``config.yaml`` alone, e.g. to map ``theta["output_params"]`` back to
@@ -60,10 +61,10 @@ def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
     declared envelope.
     """
     return ParameterScaler.from_bounds(
-        config.param_bounds.to_mapping(),
+        config.bounds,
         metadata_columns=tuple(config.metadata_columns),
         target_columns=config.resolved_target_columns,
-        time_column=config.time_column,
+        time_column=config.resolved_time_column,
         scale_metadata=config.scale_metadata,
         scale_params=config.scale_params,
         scale_time=config.scale_time,
@@ -263,7 +264,7 @@ class TelluricDataModule(pl.LightningDataModule):
             star_assignment=self.stellar_assignment,
             metadata_columns=tuple(self.config.metadata_columns),
             target_columns=self.config.resolved_target_columns,
-            time_column=self.config.time_column,
+            time_column=self.config.resolved_time_column,
         )
         logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
         dataset_cls = TelluricTimeseriesDataset

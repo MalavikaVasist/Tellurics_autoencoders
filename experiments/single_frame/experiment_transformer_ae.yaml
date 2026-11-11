@@ -48,43 +48,20 @@ data:
   # environment (YAML does not expand variables), so this same manifest works
   # on every machine; the paths below are relative to it.
   root: "${TELLURICS_DATA}"
-  # TODO: point these at the 2048-sample dataset. The HDF5 needs
-  # transmission (nights, T, 2048), wavelength (2048,) and labels with the
-  # airmass + pwv columns; the stellar pool must be on the same 2048 grid.
+  # The 2048-sample dataset: transmission (n_obs, 2048) (flat, one row per
+  # observation) or (nights, T, 2048), wavelength (2048,), and labels with
+  # series_index (flat layout), airmass and pwv. Stars on the same 2048 grid.
   night_h5: telluric_timeseries/telluric_templates_nights.h5
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
-  # Metadata fed to the model (order = metadata vector order); needs bounds
-  # below and must match model.metadata_dim.
+  # Metadata fed to the model (order = metadata vector order); must match
+  # model.metadata_dim. No time and no telluric parameters are read.
   metadata_columns: [airmass, pwv]
-  # No telluric parameters here: no parameter columns are read or required
-  # (theta.output_params is empty), and no time column (the per-observation
-  # models do not use time).
-  target_columns: []
-  time_column: null
-  scale_metadata: true                   # metadata (airmass, pwv) -> [0,1]
-  scale_params: true                     # no effect: target_columns is empty
-  scale_time: true                       # no effect: time_column is null
-  param_bounds:
-    time_hours: [0.0, 6.0]              # h    
-    pressure: [600.0, 850.0]             # hPa
-    temperature: [233.15, 318.15]        # K    (-40 .. +45 degC)
-    humidity: [0.0, 100.0]               # %
-    angle: [0.0, 90.0]                   # deg  (zenith angle)
+  scale_metadata: true                   # metadata -> [0,1] with the bounds below
+  metadata_bounds:
     airmass: [1.0, 2.0]                  # sec(z), altitude >= 30 deg
     pwv: [0.0, 25.0]                     # mm
-    co2: [420.0, 435.0]                  # ppmv
-    o3: [0.018, 0.0429]                  # ppmv
-    n2o: [0.335, 0.345]                  # ppmv
-    co: [0.088, 0.169]                   # ppmv
-    ch4: [1.90, 1.98]                    # ppmv
-    o2: [205800.0, 214200.0]             # ppmv
-    "no": [1.0e-19, 1.2e-19]             # ppmv (log-uniform in the generator; quoted key: bare 'no' is YAML boolean False)
-    so2: [9.8e-5, 1.02e-4]               # ppmv
-    no2: [2.57e-5, 1.0e-4]               # ppmv
-    nh3: [9.8e-5, 1.02e-4]               # ppmv
-    hno3: [1.74e-5, 5.6e-4]              # ppmv
 
   # Night-level split (test = 1 - train - val).
   train_fraction: 0.8

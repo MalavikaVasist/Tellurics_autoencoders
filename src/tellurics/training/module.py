@@ -100,7 +100,7 @@ class TelluricTrainingModule(pl.LightningModule):
             batch["observed"],
             stellar=batch["stellar"],
             metadata=batch["theta"]["metadata"],
-            time=batch["theta"]["time"],
+            time=batch["theta"].get("time"),          # absent for single-frame data
             wavelength=batch.get("wavelength"),
         )
 

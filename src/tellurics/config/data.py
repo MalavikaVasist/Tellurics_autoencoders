@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import math
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tellurics.config.parameters import (
@@ -18,23 +20,29 @@ class DataConfig(BaseModel):
 
     stellar_scale: bool = True
     scale_metadata: bool = True
-    scale_params: bool = True
-    scale_time: bool = True
-    param_bounds: Parameters
     # Label columns fed to the model as metadata (order = metadata vector
     # order). Default: pressure, temperature, humidity; the single-frame
     # experiments use [airmass, pwv].
     metadata_columns: list[str] = Field(
         default_factory=lambda: list(METADATA_COLUMNS), min_length=1,
     )
-    # Label columns returned as theta["output_params"] (analysis only, not a
-    # training target). None -> the default TARGET_COLUMNS; [] -> no
-    # parameter columns at all (none are read or required in the file).
-    # Every listed column must exist in the HDF5 file.
+
+    # Bounds used to scale labels to [0, 1]. Give ONE of:
+    #   metadata_bounds -- only the metadata columns, e.g.
+    #       {airmass: [1, 2], pwv: [0, 25]}; no time and no telluric
+    #       parameters are read (single-frame experiments);
+    #   param_bounds    -- the full parameter schema: metadata, time and the
+    #       telluric parameters (whole-night experiment).
+    metadata_bounds: dict[str, tuple[float, float]] | None = None
+    param_bounds: Parameters | None = None
+
+    # Only with param_bounds (whole-night experiment); ignored otherwise:
+    scale_params: bool = True
+    scale_time: bool = True
+    # Label columns returned as theta["output_params"] (analysis only).
+    # None -> the default TARGET_COLUMNS; [] -> none.
     target_columns: list[str] | None = None
-    # Label column fed to the whole-night model's TimeEncoder. null -> no time
-    # column is read or required (theta["time"] is zeros); the per-observation
-    # autoencoders do not use time.
+    # Label column fed to the whole-night model's TimeEncoder.
     time_column: str | None = TIME_COLUMN
 
     pin_memory: bool = True
@@ -57,18 +65,30 @@ class DataConfig(BaseModel):
         self.night_h5 = self._resolve(self.night_h5)
         self.phoenix_dir = self._resolve(self.phoenix_dir)
 
-        bounded = self.param_bounds.to_mapping()
+        if (self.param_bounds is None) == (self.metadata_bounds is None):
+            raise ValueError(
+                "give exactly one of data.metadata_bounds (metadata only) or "
+                "data.param_bounds (full parameter schema)"
+            )
+        for name, (low, high) in (self.metadata_bounds or {}).items():
+            if not (math.isfinite(low) and math.isfinite(high)) or low >= high:
+                raise ValueError(
+                    f"data.metadata_bounds.{name} must be finite with min < max, "
+                    f"got {[low, high]}"
+                )
+        bounded = self.bounds
+        source = "metadata_bounds" if self.param_bounds is None else "param_bounds"
         for group, columns in (
             ("metadata_columns", self.metadata_columns),
-            ("target_columns", self.target_columns or []),
-            ("time_column", [self.time_column] if self.time_column else []),
+            ("target_columns", list(self.resolved_target_columns)),
+            ("time_column", [self.resolved_time_column] if self.resolved_time_column else []),
         ):
             if len(set(columns)) != len(columns):
                 raise ValueError(f"data.{group} has duplicates: {columns}")
             missing = [c for c in columns if c not in bounded]
             if missing:
                 raise ValueError(
-                    f"data.{group} {missing} need bounds in data.param_bounds"
+                    f"data.{group} {missing} need bounds in data.{source}"
                 )
 
         if self.train_fraction + self.val_fraction >= 1.0:
@@ -79,9 +99,23 @@ class DataConfig(BaseModel):
         return self
 
     @property
+    def bounds(self) -> dict[str, tuple[float, float]]:
+        """``{column: (min, max)}`` from whichever bounds block is given."""
+        if self.param_bounds is not None:
+            return self.param_bounds.to_mapping()
+        return {k: tuple(v) for k, v in (self.metadata_bounds or {}).items()}
+
+    @property
     def resolved_target_columns(self) -> tuple[str, ...]:
-        """``target_columns`` (may be empty) or, if unset, ``TARGET_COLUMNS``."""
+        """Parameter columns to read: none without ``param_bounds``."""
+        if self.param_bounds is None:
+            return ()
         return TARGET_COLUMNS if self.target_columns is None else tuple(self.target_columns)
+
+    @property
+    def resolved_time_column(self) -> str | None:
+        """Time column to read: none without ``param_bounds``."""
+        return None if self.param_bounds is None else self.time_column
 
     def _resolve(self, path: Path) -> Path:
         path = Path(path).expanduser()

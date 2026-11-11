@@ -22,7 +22,9 @@ A sample containing a non-finite value raises instead of reaching the network.
 A batch is a set of observations (no frame axis)::
 
     observed (B, N)   stellar (B, N)   telluric (B, N)   wavelength (B, N)
-    theta.time (B,)   theta.metadata (B, M)   theta.output_params (B, P)
+    theta.metadata (B, M)
+    (+ theta.time (B,) / theta.output_params (B, P) only when a time column /
+    parameter columns are configured -- never for the single-frame configs)
 
 and the same training module / loss works unchanged (MSE over (B, N)).
 """
@@ -121,28 +123,30 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
             )
 
         observed = trans * s[None, :]                                  # (1, N)
-        time = (
-            lab[:, [self._time_idx]] if self._time_idx is not None
-            else np.zeros((1, 1), np.float32)                          # no time column
-        )                                                              # (1, 1)
         metadata = lab[:, self._metadata_idx]                          # (1, M)
-        output_params = lab[:, self._target_idx]                       # (1, P)
-
         if self.scaler is not None:
             metadata = self.scaler.transform_metadata(metadata)
-            output_params = self.scaler.transform_params(output_params)
-            time = self.scaler.transform_time(time)
+        theta = {"metadata": torch.from_numpy(metadata[0])}            # (M,)
+
+        # time / telluric parameters only when configured (whole-night style
+        # configs with param_bounds); single-frame configs read neither.
+        if self._time_idx is not None:
+            time = lab[:, [self._time_idx]]                            # (1, 1)
+            if self.scaler is not None:
+                time = self.scaler.transform_time(time)
+            theta["time"] = torch.tensor(time[0, 0], dtype=torch.float32)   # ()
+        if self._target_idx:
+            output_params = lab[:, self._target_idx]                   # (1, P)
+            if self.scaler is not None:
+                output_params = self.scaler.transform_params(output_params)
+            theta["output_params"] = torch.from_numpy(output_params[0])    # (P,)
 
         return {
             "observed": torch.from_numpy(observed[0]),                 # (N,)
             "stellar": torch.from_numpy(s),                            # (N,)
             "telluric": torch.from_numpy(trans[0]),                    # (N,)
             "wavelength": self.wavelength,                             # (N,)
-            "theta": {
-                "time": torch.tensor(time[0, 0], dtype=torch.float32), # ()
-                "metadata": torch.from_numpy(metadata[0]),             # (M,)
-                "output_params": torch.from_numpy(output_params[0]),   # (P,)
-            },
+            "theta": theta,
             "night_id": night,
             "frame_id": frame,
             "star_index": star_idx,
