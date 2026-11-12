@@ -2,7 +2,7 @@
 
 Input: the observed spectrum ``X = T_tell * S`` (the telluric transmission
 times the raw stellar spectrum, built by the dataset) and the exposure's
-metadata (``data.metadata_columns``, e.g. airmass + pwv). As in the
+metadata (``data.metadata_columns``, e.g. airmass + PWV). As in the
 whole-night model, the metadata goes through the shared
 :class:`~tellurics.models.metadata.MetadataEncoder` and its code is
 concatenated with the spectral features -- here, with the flattened conv

@@ -9,7 +9,8 @@ nights pooled). The split is night-level in
 both cases.
 
 Each night is paired with one fixed, seeded stellar spectrum:
-    observed = transmission * stellar_flux
+    observed = flux * stellar_flux
+(``flux``: the telluric spectra, HDF5 dataset ``data.target_key``.)
 """
 
 from __future__ import annotations
@@ -195,20 +196,26 @@ class TelluricDataModule(pl.LightningDataModule):
 
         import h5py
 
-        if self.observed_input:
-            key = self.config.observed_key
-            with h5py.File(night_h5, "r") as f:
+        target = self.config.target_key
+        with h5py.File(night_h5, "r") as f:
+            if target not in f:
+                raise KeyError(
+                    f"data.target_key is '{target}' but {night_h5} has no "
+                    f"'{target}' dataset; datasets: {list(f.keys())}"
+                )
+            if self.observed_input:
+                key = self.config.observed_key
                 if key not in f:
                     raise KeyError(
                         f"data.observed_key is '{key}' but {night_h5} has no "
                         f"'{key}' dataset; datasets: {list(f.keys())}"
                     )
-                if f[key].shape != f["transmission"].shape:
+                if f[key].shape != f[target].shape:
                     raise ValueError(
                         f"'{key}' {f[key].shape} must have the shape of "
-                        f"'transmission' {f['transmission'].shape} (the target)"
+                        f"'{target}' {f[target].shape} (the target)"
                     )
-        layout = read_layout(night_h5, "transmission")
+        layout = read_layout(night_h5, target)
         flat = layout["flat"]
         available_nights = layout["n_nights"]
         if flat:
@@ -313,6 +320,7 @@ class TelluricDataModule(pl.LightningDataModule):
             metadata_columns=tuple(self.config.metadata_columns),
             target_columns=self.config.resolved_target_columns,
             time_column=self.config.resolved_time_column,
+            target_key=self.config.target_key,
         )
         logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
         dataset_cls = TelluricTimeseriesDataset
@@ -330,22 +338,39 @@ class TelluricDataModule(pl.LightningDataModule):
         )
         # Gaussian noise on simulated inputs only: fresh every read for
         # training, fixed (seeded) for validation / test so their losses are
-        # comparable from epoch to epoch.
-        sigma = self.config.noise_sigma if self.config.simulated else 0.0
-        if sigma > 0:
-            logger.info(f"Gaussian input noise: {sigma:.0%} of each pixel (simulations)")
-        seed = self.config.seed
+        # comparable from epoch to epoch. Each observation draws its own
+        # relative level ~ N(noise_level_mean, noise_level_std^2).
+        cfg = self.config
+        noisy = cfg.simulated and cfg.noise_level_mean > 0
+        noise = dict(
+            noise_level_mean=cfg.noise_level_mean if noisy else 0.0,
+            noise_level_std=cfg.noise_level_std if noisy else 0.0,
+        )
+        # Augmentation: train and validation are served noise_repeats times per
+        # epoch, each pass with a different noise realization; test once.
+        repeats = cfg.noise_repeats if noisy else 1
+        if noisy:
+            logger.info(
+                f"Gaussian input noise (simulations): level ~ N({cfg.noise_level_mean:.3%}, "
+                f"{cfg.noise_level_std:.3%}) of each pixel per observation; "
+                f"train/val repeated x{repeats} per epoch with new noise"
+            )
+        seed = cfg.seed
         self.train_ds = dataset_cls(
             night_ids=self.train_ids, scaler=self.scaler,
-            noise_sigma=sigma, noise_seed=None, **common
+            noise_seed=None, repeats=repeats, **noise, **common
         )
         self.val_ds = dataset_cls(
             night_ids=self.val_ids, scaler=self.scaler,
-            noise_sigma=sigma, noise_seed=seed + 1, **common
+            noise_seed=seed + 1, repeats=repeats, **noise, **common
         )
         self.test_ds = dataset_cls(
             night_ids=self.test_ids, scaler=test_scaler,
-            noise_sigma=sigma, noise_seed=seed + 2, **common
+            noise_seed=seed + 2, repeats=1, **noise, **common
+        )
+        logger.info(
+            f"samples per epoch: train {len(self.train_ds)}, val {len(self.val_ds)}; "
+            f"test {len(self.test_ds)}"
         )
 
     def _make_real_datasets(self) -> None:

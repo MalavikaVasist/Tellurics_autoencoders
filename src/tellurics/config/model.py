@@ -167,7 +167,7 @@ class _SingleFrameConfig(BaseModel):
 class _MetadataConditionedConfig(_SingleFrameConfig):
     """Single-frame models whose input is ``observed = T * S`` + metadata.
 
-    The metadata vector (``data.metadata_columns``, e.g. airmass + pwv) is
+    The metadata vector (``data.metadata_columns``, e.g. airmass + PWV) is
     encoded by the shared :class:`~tellurics.models.metadata.MetadataEncoder`
     and joined to the spectral input, as in the whole-night model.
     """

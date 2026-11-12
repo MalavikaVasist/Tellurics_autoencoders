@@ -3,7 +3,7 @@
 The whole-night model applies it per exposure ``(B, T, M) -> (B, T, C)`` and
 concatenates the code with the spectral codes; the single-frame CNN and
 transformer autoencoders apply it to their exposure ``(B, M) -> (B, C)``.
-``M = len(data.metadata_columns)`` (e.g. airmass, pwv).
+``M = len(data.metadata_columns)`` (e.g. airmass, PWV).
 """
 
 import torch

@@ -133,10 +133,10 @@ class TestConfigs:
     )
     def test_autoencoders_take_airmass_and_pwv(self, fname) -> None:
         cfg = load_config(REPO / "experiments" / fname)
-        assert cfg.data.metadata_columns == ["airmass", "pwv"]
+        assert cfg.data.metadata_columns == ["airmass", "PWV"]
         assert cfg.model.metadata_dim == 2
         assert cfg.data.param_bounds is None
-        assert cfg.data.metadata_bounds == {"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)}
+        assert cfg.data.metadata_bounds == {"airmass": (1.0, 2.0), "PWV": (0.0, 25.0)}
 
     def test_whole_night_keeps_its_three_metadata_columns(self) -> None:
         cfg = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml")
@@ -155,8 +155,8 @@ class TestConfigs:
         raw = load_config(
             REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
         ).model_dump(mode="json")
-        raw["data"]["metadata_bounds"].pop("pwv")
-        with pytest.raises(ValidationError, match="pwv"):
+        raw["data"]["metadata_bounds"].pop("PWV")
+        with pytest.raises(ValidationError, match="PWV"):
             ExperimentConfig(**raw)
 
     def test_exactly_one_bounds_block(self) -> None:
@@ -171,7 +171,7 @@ class TestConfigs:
         raw = load_config(
             REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
         ).model_dump(mode="json")
-        raw["data"]["metadata_bounds"]["pwv"] = [25.0, 0.0]
+        raw["data"]["metadata_bounds"]["PWV"] = [25.0, 0.0]
         with pytest.raises(ValidationError, match="min < max"):
             ExperimentConfig(**raw)
 
@@ -461,7 +461,7 @@ class _DistinctStars:
 
 
 def _write_flat_file(path, frames=FLAT_FRAMES, nan_row: int | None = None) -> None:
-    """transmission (n_obs, N), labels (n_obs, P) with series_index; rows shuffled."""
+    """flux (n_obs, N), labels (n_obs, P) with series_index; rows shuffled."""
     import h5py
     from tellurics.config.parameters import PHYSICAL_COLUMNS
 
@@ -480,7 +480,7 @@ def _write_flat_file(path, frames=FLAT_FRAMES, nan_row: int | None = None) -> No
     if nan_row is not None:
         trans[nan_row, 0] = np.nan
     with h5py.File(path, "w") as f:
-        f.create_dataset("transmission", data=trans)
+        f.create_dataset("flux", data=trans)
         f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N_WAVE))
         f.create_dataset("labels", data=labels).attrs["columns"] = np.array(columns, dtype="S")
 
@@ -607,7 +607,7 @@ def _write_minimal_flat_file(path, frames=FLAT_FRAMES) -> None:
     labels = np.array([[sid, 1.0 + 0.1 * k, sid / 10.0] for sid, k in rows], np.float32)
     trans = np.array([np.full(N_WAVE, 0.5 + 0.01 * sid + 0.001 * k) for sid, k in rows], np.float32)
     with h5py.File(path, "w") as f:
-        f.create_dataset("transmission", data=trans)
+        f.create_dataset("flux", data=trans)
         f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N_WAVE))
         f.create_dataset("labels", data=labels).attrs["columns"] = np.array(columns, dtype="S")
 
@@ -621,7 +621,7 @@ class TestNoParameters:
         data = load_config(REPO / "experiments" / "single_frame" / fname).data
         assert data.param_bounds is None
         assert data.resolved_target_columns == () and data.resolved_time_column is None
-        assert set(data.bounds) == {"airmass", "pwv"}
+        assert set(data.bounds) == {"airmass", "PWV"}
 
     def test_whole_night_manifest_keeps_parameters_and_time(self) -> None:
         data = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml").data
@@ -686,12 +686,12 @@ class TestNoParameters:
 # data.observed_key set -- the file already holds the observed flux
 # --------------------------------------------------------------------------- #
 def _write_observed_flat_file(path, frames=FLAT_FRAMES, key="observed", bad_shape=False) -> None:
-    """Flat file with 'observed' (input) and 'transmission' (target), no stars."""
+    """Flat file with 'observed' (input) and 'flux' (target), no stars."""
     import h5py
 
     _write_minimal_flat_file(path, frames)
     with h5py.File(path, "a") as f:
-        trans = f["transmission"][:]
+        trans = f["flux"][:]
         observed = (trans * (1.0 + 0.5 * np.sin(np.arange(N_WAVE)))[None, :]).astype(np.float32)
         f.create_dataset(key, data=observed[:, :-1] if bad_shape else observed)
 
@@ -712,7 +712,7 @@ class TestObservedInput:
                   "multiple_frames/experiment.yaml"):
             data = load_config(REPO / "experiments" / f).data
             assert data.observed_key is None                 # tellurics x star
-            assert data.simulated and data.noise_sigma == 0.1
+            assert data.simulated and data.noise_level_mean == 0.01 and data.noise_level_std == 0.001
             assert data.real == []
 
     def test_full_setup_without_any_stellar_spectra(self, tmp_path) -> None:
@@ -728,7 +728,7 @@ class TestObservedInput:
         assert not (tmp_path / "stellar_assignment.csv").exists()
 
         with h5py.File(path, "r") as f:
-            observed, trans = f["observed"][:], f["transmission"][:]
+            observed, trans = f["observed"][:], f["flux"][:]
         ds = dm.train_ds
         for i in range(len(ds)):
             x = ds[i]
@@ -762,8 +762,8 @@ class TestObservedInput:
         from tellurics.data.datamodule import TelluricDataModule
 
         path = tmp_path / "obs.h5"
-        _write_observed_flat_file(path, key="flux")
-        dm = TelluricDataModule(_observed_config(path, observed_key="flux"),
+        _write_observed_flat_file(path, key="flux_obs")
+        dm = TelluricDataModule(_observed_config(path, observed_key="flux_obs"),
                                 run_dir=tmp_path, single_frame=True)
         dm.setup()
         assert len(dm.train_ds) > 0

@@ -19,7 +19,7 @@
 #
 # Contract with tellurics.data.datamodule (must not be changed blindly):
 #   metadata_dim        == 3       # pressure, temperature, humidity (per exposure)
-#   num_wavelength_bins == 51557   # = transmission.shape[-1] in the night HDF5
+#   num_wavelength_bins == 51557   # = flux.shape[-1] in the night HDF5
 
 # Artefacts (config.yaml, stellar_assignment.csv, logs/, checkpoints/) land here.
 run_dir: runs/experiment
@@ -65,14 +65,24 @@ data:
   # on every machine; the paths below are relative to it.
   root: "${TELLURICS_DATA}"
   night_h5: telluric_timeseries/telluric_templates_nights.h5   # built by tests/testing_dataset_reshape.ipynb
-  # Model input of night_h5 ('transmission' is always the target):
+  # HDF5 dataset with the telluric spectra (the target; with observed_key:
+  # null also multiplied by the star to build the input)
+  target_key: flux
+  # Model input of night_h5 (target_key is always the target):
   #   null      -- pure tellurics: every night gets a fixed star from
-  #                phoenix_dir and observed = transmission * star
+  #                phoenix_dir and observed = flux * star
   #   "<name>"  -- the observed flux is already in the file under that
   #                dataset name; no stars are loaded, assigned or multiplied
   observed_key: null
   simulated: true                        # night_h5 is simulated -> gets the noise below
-  noise_sigma: 0.1                       # Gaussian input noise, sigma = 10% of each pixel (simulations only)
+  # Gaussian input noise (simulations only), relative to each pixel: every
+  # observation draws its level ~ N(mean, std^2), then
+  # observed += level * observed * N(0, 1) per pixel.
+  noise_level_mean: 0.01                 # 1% noise on average
+  noise_level_std: 0.001                 # spread of the level: 10% of the 1%
+  # Augmentation: each epoch goes over train and val this many times, each
+  # pass with a new noise realization (test once). 1 -> no repeats.
+  noise_repeats: 5
   # Real observations: observed flux, no telluric target. Not trained on, not
   # noised; after training the best model predicts their tellurics into
   # <run_dir>/predictions/<name>.h5 (or: train --predict CKPT). Example:

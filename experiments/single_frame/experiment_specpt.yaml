@@ -45,18 +45,28 @@ data:
   # environment (YAML does not expand variables), so this same manifest works
   # on every machine; the paths below are relative to it.
   root: "${TELLURICS_DATA}"
-  # The 2048-sample dataset: transmission (n_obs, 2048) (flat, one row per
+  # The 2048-sample dataset: flux (n_obs, 2048) (flat, one row per
   # observation) or (nights, T, 2048), wavelength (2048,), and labels with
-  # series_index (flat layout), airmass and pwv. Stars on the same 2048 grid.
+  # series_index (flat layout), airmass and PWV. Stars on the same 2048 grid.
   night_h5: telluric_timeseries/telluric_templates_nights.h5
-  # Model input of night_h5 ('transmission' is always the target):
+  # HDF5 dataset with the telluric spectra (the target; with observed_key:
+  # null also multiplied by the star to build the input)
+  target_key: flux
+  # Model input of night_h5 (target_key is always the target):
   #   null      -- pure tellurics: every night gets a fixed star from
-  #                phoenix_dir and observed = transmission * star
+  #                phoenix_dir and observed = flux * star
   #   "<name>"  -- the observed flux is already in the file under that
   #                dataset name; no stars are loaded, assigned or multiplied
   observed_key: null
   simulated: true                        # night_h5 is simulated -> gets the noise below
-  noise_sigma: 0.1                       # Gaussian input noise, sigma = 10% of each pixel (simulations only)
+  # Gaussian input noise (simulations only), relative to each pixel: every
+  # observation draws its level ~ N(mean, std^2), then
+  # observed += level * observed * N(0, 1) per pixel.
+  noise_level_mean: 0.01                 # 1% noise on average
+  noise_level_std: 0.001                 # spread of the level: 10% of the 1%
+  # Augmentation: each epoch goes over train and val this many times, each
+  # pass with a new noise realization (test once). 1 -> no repeats.
+  noise_repeats: 5
   # Real observations: observed flux, no telluric target. Not trained on, not
   # noised; after training the best model predicts their tellurics into
   # <run_dir>/predictions/<name>.h5 (or: train --predict CKPT). Example:
@@ -70,11 +80,11 @@ data:
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
   # Metadata fed to the model (order = metadata vector order); must match
   # model.metadata_dim. No time and no telluric parameters are read.
-  metadata_columns: [airmass, pwv]
+  metadata_columns: [airmass, PWV]
   scale_metadata: true                   # metadata -> [0,1] with the bounds below
   metadata_bounds:
     airmass: [1.0, 2.0]                  # sec(z), altitude >= 30 deg
-    pwv: [0.0, 25.0]                     # mm
+    PWV: [0.0, 25.0]                     # mm
 
   # Night-level split (test = 1 - train - val).
   train_fraction: 0.8
@@ -90,7 +100,7 @@ training:
   scheduler:
     scheduler_type: cosine               # SchedulerType enum value
     min_lr: 1e-6
-  max_epochs: 30                     # one epoch = every observation (exposure) of every training night
+  max_epochs: 30                     # one epoch = every training observation x data.noise_repeats
   precision: 16-mixed                    # use "32" on a CPU-only machine
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1             # accumulate gradients over this many batches before stepping the optimizer

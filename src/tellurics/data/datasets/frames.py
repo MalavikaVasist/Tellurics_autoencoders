@@ -10,18 +10,24 @@ exposure of a validation or test night is ever seen in training.
 
 Two HDF5 layouts are supported:
 
-* **flat** (recommended for single frames): ``transmission (n_obs, N)`` and
+* **flat** (recommended for single frames): ``flux (n_obs, N)`` and
   ``labels (n_obs, P)``, one row per observation, with a ``series_index``
   label column saying which night (telluric series) a row belongs to. Nights
   may have *different* numbers of frames -- no padding, no NaNs.
-* **night-major**: ``transmission (n_nights, T, N)``, every night with the
+* **night-major**: ``flux (n_nights, T, N)``, every night with the
   same ``T`` frames.
 
+(``flux`` is the default dataset name of the telluric spectra; set by
+``data.target_key``.)
+
 Input: with ``data.observed_key: null`` the observed flux is built as
-``transmission * S`` with the night's fixed star; with ``observed_key`` set
-it is read from that dataset and no stellar spectra are used (samples then
-carry no ``stellar`` / ``star_index``). Simulated inputs can get Gaussian
-noise (``noise_sigma``). The target is ``transmission``; real observations
+``flux * S`` with the night's fixed star; with ``observed_key`` set it is
+read from that dataset and no stellar spectra are used (samples then carry no
+``stellar`` / ``star_index``). Simulated inputs can get Gaussian noise: each
+observation draws a level ~ N(noise_level_mean, noise_level_std^2) and gets
+``level * observed * N(0, 1)`` per pixel. With ``repeats = R`` the dataset is
+served R times per epoch, each pass with a new noise realization
+(augmentation). The target is the telluric ``flux``; real observations
 (``has_target=False``) have none and carry no ``telluric``.
 
 A sample containing a non-finite value raises instead of reaching the network.
@@ -82,15 +88,20 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         night_rows: dict[int, np.ndarray] | None = None,
         time_column: str | None = TIME_COLUMN,
         observed_key: str | None = None,
-        noise_sigma: float = 0.0,
+        noise_level_mean: float = 0.0,
+        noise_level_std: float = 0.0,
         noise_seed: int | None = None,
         has_target: bool = True,
+        target_key: str = "flux",
+        repeats: int = 1,
     ) -> None:
         super().__init__(
             night_ids, h5_path, pool, star_assignment, scaler,
             metadata_columns=metadata_columns, target_columns=target_columns,
             time_column=time_column, observed_key=observed_key,
-            noise_sigma=noise_sigma, noise_seed=noise_seed, has_target=has_target,
+            noise_level_mean=noise_level_mean, noise_level_std=noise_level_std,
+            noise_seed=noise_seed, has_target=has_target,
+            target_key=target_key, repeats=repeats,
         )
         self.flat = night_rows is not None
         if self.flat:
@@ -109,17 +120,20 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
                 for frame in range(int(n_frames))
             ]
 
-    def __len__(self) -> int:
+    def _n_base(self) -> int:
+        """Distinct observations (before augmentation repeats)."""
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict[str, object]:
-        night, row, frame = self._index[int(idx)]
+        # idx runs over n_base * repeats: idx % n_base picks the observation,
+        # the full idx seeds its noise (a different realization per repeat)
+        night, row, frame = self._index[int(idx) % self._n_base()]
         at = np.s_[row:row + 1] if self.flat else np.s_[night, frame:frame + 1]
 
         # read as (1, N) / (1, P): the scaler works on 2-D groups
         with self._open() as f:
             trans, lab, stored = self._read(f, at)
-        observed, s, star_idx = self._input(idx, night, trans, stored)    # (1, N)
+        observed, s, star_idx, level = self._input(idx, night, trans, stored)  # (1, N)
         where = f"row {row}" if self.flat else f"frame {frame}"
         self._check_finite(f"night {night}, {where}", trans, observed)
 
@@ -153,4 +167,6 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         if s is not None:
             sample["stellar"] = torch.from_numpy(s)                    # (N,)
             sample["star_index"] = star_idx
+        if level is not None:
+            sample["noise_level"] = torch.tensor(level[0])            # () relative sigma used
         return sample

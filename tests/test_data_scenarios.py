@@ -85,7 +85,7 @@ def _write(path, *, flat: bool, observed: bool, target: bool = True, seed: int =
     trans = (0.6 + 0.3 * rng.random(shape)).astype(np.float32)
     with h5py.File(path, "w") as f:
         if target:
-            f.create_dataset("transmission", data=trans)
+            f.create_dataset("flux", data=trans)
         if observed:
             f.create_dataset("observed", data=(trans * 3.0).astype(np.float32))
         f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N))
@@ -147,7 +147,7 @@ def test_single_frame_scenarios(tmp_path, kind, observed) -> None:
     _write(real, flat=True, observed=True, target=False, seed=1)
     data = DataConfig(
         night_h5=sim, observed_key="observed" if observed else None,
-        simulated=True, noise_sigma=0.1,
+        simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2,
         metadata_columns=["airmass", "pwv"],
         metadata_bounds={"airmass": FULL_BOUNDS["airmass"], "pwv": FULL_BOUNDS["pwv"]},
         real=[{"name": "obs1", "night_h5": real, "observed_key": "observed"}],
@@ -174,7 +174,7 @@ def test_time_series_scenarios(tmp_path, observed) -> None:
     _write(real, flat=False, observed=True, target=False, seed=1)
     data = DataConfig(
         night_h5=sim, observed_key="observed" if observed else None,
-        simulated=True, noise_sigma=0.1, param_bounds=FULL_BOUNDS,
+        simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2, param_bounds=FULL_BOUNDS,
         real=[{"name": "obs1", "night_h5": real, "observed_key": "observed"}],
     )
     # real observations have no stellar spectrum -> whole-night without stellar input
@@ -189,7 +189,7 @@ def test_time_series_scenarios(tmp_path, observed) -> None:
 def test_time_series_with_stellar_input(tmp_path) -> None:
     sim = tmp_path / "sim.h5"
     _write(sim, flat=False, observed=False)
-    data = DataConfig(night_h5=sim, simulated=True, noise_sigma=0.1, param_bounds=FULL_BOUNDS)
+    data = DataConfig(night_h5=sim, simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2, param_bounds=FULL_BOUNDS)
     dm, module, written = _run(_whole_night_model(use_stellar=True), data, tmp_path,
                                single_frame=False)
     assert "stellar" in dm.train_ds[0] and written == []
@@ -198,12 +198,13 @@ def test_time_series_with_stellar_input(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 # Noise: simulations only; random in training, fixed in validation / test
 # --------------------------------------------------------------------------- #
-def _noise_dm(tmp_path, simulated=True, sigma=0.1, real=False):
+def _noise_dm(tmp_path, simulated=True, mean=0.01, std=0.001, repeats=1, real=False):
     sim, rl = tmp_path / "sim.h5", tmp_path / "real.h5"
     _write(sim, flat=True, observed=True)
     _write(rl, flat=True, observed=True, target=False, seed=1)
     data = DataConfig(
-        night_h5=sim, observed_key="observed", simulated=simulated, noise_sigma=sigma,
+        night_h5=sim, observed_key="observed", simulated=simulated,
+        noise_level_mean=mean, noise_level_std=std, noise_repeats=repeats,
         metadata_columns=["airmass", "pwv"],
         metadata_bounds={"airmass": FULL_BOUNDS["airmass"], "pwv": FULL_BOUNDS["pwv"]},
         real=[{"name": "obs1", "night_h5": rl}] if real else [],
@@ -219,15 +220,62 @@ def _stored(path, ds, i):
         return f["observed"][row]
 
 
-def test_noise_is_ten_percent_per_pixel(tmp_path) -> None:
-    dm, sim, _ = _noise_dm(tmp_path)
+def test_noise_level_is_drawn_per_observation(tmp_path) -> None:
+    """level ~ N(1%, 0.1%) per observation; noise = level * observed * N(0, 1)."""
+    dm, sim, _ = _noise_dm(tmp_path, mean=0.01, std=0.001)
     ds = dm.train_ds
-    rel = []
-    for i in range(len(ds)):
-        clean = _stored(sim, ds, i)
-        rel.append((ds[i]["observed"].numpy() - clean) / clean)
-    rel = np.concatenate(rel)
-    assert abs(rel.mean()) < 0.02 and abs(rel.std() - 0.1) < 0.01   # N(0, 0.1^2) relative
+    levels, stds = [], []
+    for _ in range(20):
+        for i in range(len(ds)):
+            x = ds[i]
+            clean = _stored(sim, ds, i)
+            rel = (x["observed"].numpy() - clean) / clean
+            levels.append(float(x["noise_level"]))
+            stds.append(rel.std() / float(x["noise_level"]))
+    levels = np.array(levels)
+    assert abs(levels.mean() - 0.01) < 0.0005 and abs(levels.std() - 0.001) < 0.0003
+    assert abs(np.mean(stds) - 1.0) < 0.05             # per-pixel noise has std = level
+
+
+def test_noise_repeats_multiply_train_and_val_not_test(tmp_path) -> None:
+    (tmp_path / "a").mkdir(); (tmp_path / "b").mkdir()
+    dm1, _, _ = _noise_dm(tmp_path / "a", repeats=1)
+    dm3, _, _ = _noise_dm(tmp_path / "b", repeats=3)
+    assert len(dm3.train_ds) == 3 * len(dm1.train_ds)
+    assert len(dm3.val_ds) == 3 * len(dm1.val_ds)
+    assert len(dm3.test_ds) == len(dm1.test_ds)
+    n = dm3.val_ds._n_base()
+    a, b = dm3.val_ds[0], dm3.val_ds[n]                # same observation, next repeat
+    assert (a["night_id"], a["frame_id"]) == (b["night_id"], b["frame_id"])
+    assert not torch.equal(a["observed"], b["observed"])   # different noise realization
+    assert torch.equal(a["observed"], dm3.val_ds[0]["observed"])   # but fixed per epoch
+
+
+def test_repeats_without_noise_are_rejected(tmp_path) -> None:
+    sim = tmp_path / "sim.h5"
+    _write(sim, flat=True, observed=True)
+    with pytest.raises(ValueError, match="noise_repeats"):
+        DataConfig(night_h5=sim, observed_key="observed", noise_repeats=2,
+                   metadata_columns=["airmass", "pwv"],
+                   metadata_bounds={"airmass": (1, 2), "pwv": (0, 25)})
+
+
+def test_target_key_selects_the_hdf5_dataset(tmp_path) -> None:
+    """Default 'flux'; an older file with 'transmission' works via target_key."""
+    sim = tmp_path / "sim.h5"
+    _write(sim, flat=True, observed=True)
+    with h5py.File(sim, "a") as f:
+        f["transmission"] = f["flux"][:]
+        del f["flux"]
+    kw = dict(night_h5=sim, observed_key="observed", metadata_columns=["airmass", "pwv"],
+              metadata_bounds={"airmass": (1, 2), "pwv": (0, 25)})
+    dm = TelluricDataModule(DataConfig(**kw), run_dir=tmp_path, num_workers=0, single_frame=True)
+    with pytest.raises(KeyError, match="target_key"):
+        dm.setup()
+    dm = TelluricDataModule(DataConfig(target_key="transmission", **kw), run_dir=tmp_path,
+                            num_workers=0, single_frame=True)
+    dm.setup()
+    assert dm.train_ds[0]["telluric"].shape == (N,)
 
 
 def test_training_noise_is_fresh_validation_noise_is_fixed(tmp_path) -> None:
@@ -249,7 +297,7 @@ def test_real_observations_never_get_noise(tmp_path) -> None:
 
 
 def test_no_noise_when_not_simulated(tmp_path) -> None:
-    dm, sim, _ = _noise_dm(tmp_path, simulated=False, sigma=0.0)
+    dm, sim, _ = _noise_dm(tmp_path, simulated=False, mean=0.0, std=0.0)
     ds = dm.train_ds
     assert np.array_equal(ds[0]["observed"].numpy(), _stored(sim, ds, 0))
 
@@ -258,7 +306,7 @@ def test_noise_on_non_simulated_data_is_rejected(tmp_path) -> None:
     sim = tmp_path / "sim.h5"
     _write(sim, flat=True, observed=True)
     with pytest.raises(ValueError, match="simulated"):
-        DataConfig(night_h5=sim, observed_key="observed", simulated=False, noise_sigma=0.1,
+        DataConfig(night_h5=sim, observed_key="observed", simulated=False, noise_level_mean=0.01,
                    metadata_columns=["airmass", "pwv"],
                    metadata_bounds={"airmass": (1, 2), "pwv": (0, 25)})
 

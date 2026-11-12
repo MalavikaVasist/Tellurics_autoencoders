@@ -2,7 +2,7 @@
 
 Input: the observed spectrum ``X = T_tell * S`` (telluric transmission times
 the raw stellar spectrum, built by the dataset), its wavelength grid, and the
-exposure's metadata (``data.metadata_columns``, e.g. airmass + pwv).
+exposure's metadata (``data.metadata_columns``, e.g. airmass + PWV).
 
 * **Wavelengths as positional encoding.** Every flux patch is embedded and
   added to an encoding of *its own wavelengths*: the grid is normalised to

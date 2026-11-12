@@ -31,10 +31,14 @@ class DataConfig(BaseModel):
     night_h5: Path = Path("telluric_timeseries/telluric_templates_nights.h5")
     phoenix_dir: Path = Path("phoenix/convolved")
 
-    # Model input of night_h5 (the training data; 'transmission' is always
-    # the target):
+    # HDF5 dataset holding the telluric spectra: the training target, and
+    # (with observed_key: null) multiplied by the star to build the input.
+    target_key: str = Field(default="flux", min_length=1)
+
+    # Model input of night_h5 (the training data; target_key is always the
+    # target):
     #   null  -- night_h5 holds pure tellurics: every night gets a fixed
-    #            PHOENIX star and observed = transmission * star
+    #            PHOENIX star and observed = flux * star
     #   "<name>" -- night_h5 already holds the observed flux in that dataset:
     #            no stellar spectra are loaded, assigned or multiplied
     observed_key: str | None = None
@@ -42,9 +46,17 @@ class DataConfig(BaseModel):
     # Is night_h5 simulated? Only simulated inputs get noise.
     simulated: bool = True
     # Gaussian noise added to simulated inputs, relative per pixel:
-    # observed + N(0, (noise_sigma * observed)^2). 0 -> no noise. Training
-    # draws fresh noise every time; validation/test use fixed, seeded noise.
-    noise_sigma: float = Field(default=0.0, ge=0.0)
+    #   level ~ N(noise_level_mean, noise_level_std^2), one draw per
+    #           observation (clipped at 0)
+    #   observed + level * observed * N(0, 1)   (independent per pixel)
+    # noise_level_mean 0 -> no noise. Training draws fresh noise on every
+    # read; validation/test use fixed, seeded noise.
+    noise_level_mean: float = Field(default=0.0, ge=0.0)
+    noise_level_std: float = Field(default=0.0, ge=0.0)
+    # Data augmentation: every epoch goes over the training and validation
+    # observations this many times, each pass with a different noise
+    # realization (test: once). Needs noise; 1 -> each observation once.
+    noise_repeats: int = Field(default=1, ge=1)
 
     # Real observations (observed flux, no telluric target): not trained on,
     # not noised; predicted after training.
@@ -54,14 +66,14 @@ class DataConfig(BaseModel):
     scale_metadata: bool = True
     # Label columns fed to the model as metadata (order = metadata vector
     # order). Default: pressure, temperature, humidity; the single-frame
-    # experiments use [airmass, pwv].
+    # experiments use [airmass, PWV].
     metadata_columns: list[str] = Field(
         default_factory=lambda: list(METADATA_COLUMNS), min_length=1,
     )
 
     # Bounds used to scale labels to [0, 1]. Give ONE of:
     #   metadata_bounds -- only the metadata columns, e.g.
-    #       {airmass: [1, 2], pwv: [0, 25]}; no time and no telluric
+    #       {airmass: [1, 2], PWV: [0, 25]}; no time and no telluric
     #       parameters are read (single-frame experiments);
     #   param_bounds    -- the full parameter schema: metadata, time and the
     #       telluric parameters (whole-night experiment).
@@ -101,10 +113,15 @@ class DataConfig(BaseModel):
         names = [r.name for r in self.real]
         if len(set(names)) != len(names):
             raise ValueError(f"data.real names must be unique: {names}")
-        if self.noise_sigma > 0 and not self.simulated:
+        if self.noise_level_mean > 0 and not self.simulated:
             raise ValueError(
-                "data.noise_sigma > 0 but data.simulated is false: noise is "
-                "only added to simulations"
+                "data.noise_level_mean > 0 but data.simulated is false: noise "
+                "is only added to simulations"
+            )
+        if self.noise_repeats > 1 and self.noise_level_mean == 0:
+            raise ValueError(
+                "data.noise_repeats > 1 needs noise (data.noise_level_mean > 0): "
+                "without noise every repeat would be the same observation"
             )
 
         if (self.param_bounds is None) == (self.metadata_bounds is None):

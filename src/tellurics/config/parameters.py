@@ -10,7 +10,7 @@ The field order of :class:`Parameters` defines:
 - ``PHYSICAL_COLUMNS``: all physical parameter names.
 - ``TARGET_COLUMNS``: parameters predicted by the model.
 - ``METADATA_COLUMNS``: default metadata columns (an experiment can pick
-  others with ``data.metadata_columns``, e.g. ``[airmass, pwv]``).
+  others with ``data.metadata_columns``, e.g. ``[airmass, PWV]``).
 - ``TIME_COLUMN``: the time input used by the TimeEncoder.
 
 """

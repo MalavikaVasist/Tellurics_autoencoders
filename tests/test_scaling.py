@@ -87,7 +87,7 @@ def _write_night_file(path, n_nights: int = 2) -> None:
 
     with h5py.File(path, "w") as f:
         f.create_dataset(
-            "transmission",
+            "flux",
             data=np.full((n_nights, N_FRAMES, N_WAVE), 0.5, np.float32),
         )
         f.create_dataset("wavelength", data=np.linspace(2000.0, 2100.0, N_WAVE))

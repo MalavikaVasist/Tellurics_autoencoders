@@ -1,7 +1,8 @@
 """Whole-night dataset: one sample = one night of exposures.
 
 Reads the night-major HDF5 built once by ``tests/testing_dataset_reshape.ipynb``
-(``transmission`` / ``labels`` / ``wavelength``) and turns each night into the
+(``flux`` / ``labels`` / ``wavelength``; the telluric dataset name is
+``data.target_key``) and turns each night into the
 inputs the :class:`~tellurics.models.multiple_frames.predictor.NeuralTelluricPredictor` consumes.
 
 When a :class:`~tellurics.data.scaling.ParameterScaler` is supplied, the
@@ -71,7 +72,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
     """Whole-night samples from the night-major HDF5.
 
     Each sample is one night ``(T, N)``. The observed spectrum is
-    ``observed = transmission * S`` with ``S`` the stellar spectrum assigned
+    ``observed = flux * S`` with ``S`` the stellar spectrum assigned
     to that night (fixed), which is also returned so the estimator encodes it.
 
     Returns a dict with:
@@ -109,20 +110,34 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         target_columns: tuple[str, ...] | list[str] | None = None,
         time_column: str | None = TIME_COLUMN,
         observed_key: str | None = None,
-        noise_sigma: float = 0.0,
+        noise_level_mean: float = 0.0,
+        noise_level_std: float = 0.0,
         noise_seed: int | None = None,
         has_target: bool = True,
+        target_key: str = "flux",
+        repeats: int = 1,
     ) -> None:
         super().__init__()
         # observed_key set -> the file already holds the observed flux under
         # that key: no stars are assigned or multiplied.
         self.observed_key = observed_key
-        # Gaussian noise on the input, relative per pixel (simulations only):
+        # Gaussian noise on the input, relative per pixel (simulations only).
+        # Each observation draws its level ~ N(mean, std^2) (clipped at 0),
+        # then observed += level * observed * N(0, 1) per pixel.
         # noise_seed None -> fresh noise on every read (training); an int ->
         # the same noise for a sample on every read (validation / test).
-        self.noise_sigma = float(noise_sigma)
+        self.noise_level_mean = float(noise_level_mean)
+        self.noise_level_std = float(noise_level_std)
         self.noise_seed = noise_seed
-        # has_target False -> real observations: no 'transmission' is read and
+        # Augmentation: the dataset is served `repeats` times per epoch;
+        # sample i and i + k * n_base are the same observation with different
+        # noise (fresh, or seeded by the full index).
+        if repeats < 1:
+            raise ValueError(f"repeats must be >= 1, got {repeats}")
+        self.repeats = int(repeats)
+        # HDF5 dataset holding the telluric spectra (the target).
+        self.target_key = target_key
+        # has_target False -> real observations: no target is read and
         # samples carry no 'telluric' (prediction only).
         self.has_target = has_target
         if not has_target and observed_key is None:
@@ -200,9 +215,9 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
     # -- input construction shared with TelluricFrameDataset -------------- #
     def _read(self, f, at) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None]:
-        """``(transmission | None, labels, stored observed flux | None)`` at ``at``."""
+        """``(target flux | None, labels, stored observed flux | None)`` at ``at``."""
         trans = (
-            np.asarray(f["transmission"][at], np.float32) if self.has_target else None
+            np.asarray(f[self.target_key][at], np.float32) if self.has_target else None
         )
         lab = np.asarray(f["labels"][at], np.float32)
         observed = (
@@ -213,11 +228,12 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
     def _input(
         self, idx: int, night: int, trans: np.ndarray | None, stored: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray | None, int | None]:
-        """The model input ``(observed, star spectrum | None, star index | None)``.
+    ) -> tuple[np.ndarray, np.ndarray | None, int | None, np.ndarray | None]:
+        """The model input ``(observed, star | None, star index | None, noise level | None)``.
 
-        Stored observed flux is used as is; otherwise ``transmission * S`` with
-        the night's fixed star. Then the (simulation-only) noise is added.
+        Stored observed flux is used as is; otherwise ``flux * S`` with the
+        night's fixed star. Then the (simulation-only) noise is added: one
+        level per observation (row), drawn from N(mean, std^2).
         """
         s = star_idx = None
         if stored is not None:
@@ -226,14 +242,19 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
             star_idx = int(self.star_assignment[night])               # same star for the whole night
             s, _ = self.pool[star_idx]                                # (N,)
             observed = trans * s[None, :]
-        if self.noise_sigma > 0:
+        level = None
+        if self.noise_level_mean > 0:
             rng = (
                 np.random.default_rng() if self.noise_seed is None
                 else np.random.default_rng([self.noise_seed, int(idx)])
             )
+            n_obs = observed.shape[0]                                 # rows = observations
+            level = self.noise_level_mean + self.noise_level_std * rng.standard_normal((n_obs, 1))
+            level = np.clip(level, 0.0, None).astype(np.float32)      # (n_obs, 1)
             noise = rng.standard_normal(observed.shape).astype(np.float32)
-            observed = observed + self.noise_sigma * observed * noise
-        return observed, s, star_idx
+            observed = observed + level * observed * noise
+            level = level[:, 0]                                       # (n_obs,)
+        return observed, s, star_idx, level
 
     def _check_finite(self, what: str, *arrays: np.ndarray | None) -> None:
         if not all(np.isfinite(a).all() for a in arrays if a is not None):
@@ -243,14 +264,18 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
                 "observation)"
             )
 
-    def __len__(self) -> int:
+    def _n_base(self) -> int:
+        """Distinct samples (before augmentation repeats)."""
         return len(self.night_ids)
 
+    def __len__(self) -> int:
+        return self._n_base() * self.repeats
+
     def __getitem__(self, idx: int) -> dict[str, object]:
-        night = self.night_ids[idx]
+        night = self.night_ids[int(idx) % self._n_base()]
         with self._open() as f:
             trans, lab, stored = self._read(f, night)                   # (T, N), (T, P)
-        observed, s, star_idx = self._input(idx, night, trans, stored)  # (T, N)
+        observed, s, star_idx, level = self._input(idx, night, trans, stored)  # (T, N)
         self._check_finite(f"night {night}", trans, observed)
 
         # Slice ``time_hours`` as (T, 1) so every group handed to the scaler is
@@ -284,4 +309,6 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         if s is not None:
             sample["stellar"] = torch.from_numpy(s)
             sample["star_index"] = star_idx
+        if level is not None:
+            sample["noise_level"] = torch.from_numpy(level)        # (T,) relative sigma used
         return sample

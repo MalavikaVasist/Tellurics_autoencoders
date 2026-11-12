@@ -5,7 +5,7 @@ observations (the exposures of all nights pooled, so nights may contribute
 different numbers of frames)::
 
     observed   (B, N)  = T_tell * S
-    metadata   (B, M)  e.g. airmass, pwv
+    metadata   (B, M)  e.g. airmass, PWV
     wavelength (B, N)  grid of observed (or (N,), shared)
     reconstruct(x, m, wl)  -->  z (B, N)
     z + template (N,)  --activation-->  telluric_pred (B, N)
