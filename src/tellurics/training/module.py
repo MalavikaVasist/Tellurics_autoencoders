@@ -98,7 +98,7 @@ class TelluricTrainingModule(pl.LightningModule):
         """Run the estimator using a DataModule batch."""
         return self(
             batch["observed"],
-            stellar=batch["stellar"],
+            stellar=batch.get("stellar"),             # absent for data.input: observed
             metadata=batch["theta"]["metadata"],
             time=batch["theta"].get("time"),          # absent for single-frame data
             wavelength=batch.get("wavelength"),

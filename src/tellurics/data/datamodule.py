@@ -129,8 +129,20 @@ class TelluricDataModule(pl.LightningDataModule):
         self._load_metadata()  # shapes + wavelength grid
         self._make_scaler()    # [0,1] scaling from the declared bounds
         self._make_splits()    # night-level train/val/test
-        self._assign_stars()   # fixed stellar spectrum per night + audit CSV
+        if self.observed_input:
+            # The file already holds the observed flux: no stellar spectra.
+            logger.info(
+                f"data.input = observed: reading '{self.config.observed_key}' "
+                "as the observed flux; no stellar spectra assigned"
+            )
+        else:
+            self._assign_stars()   # fixed stellar spectrum per night + audit CSV
         self._make_datasets()  # one dataset per split
+
+    @property
+    def observed_input(self) -> bool:
+        """``data.input: observed`` -- the HDF5 already holds the observed flux."""
+        return self.config.input == "observed"
 
     def _load_metadata(self) -> None:
         """Read the shapes and the wavelength grid."""
@@ -147,6 +159,18 @@ class TelluricDataModule(pl.LightningDataModule):
 
         with h5py.File(night_h5, "r") as f:
             flat = f["transmission"].ndim == 2
+            if self.observed_input:
+                key = self.config.observed_key
+                if key not in f:
+                    raise KeyError(
+                        f"data.input is 'observed' but {night_h5} has no '{key}' "
+                        f"dataset (data.observed_key); datasets: {list(f.keys())}"
+                    )
+                if f[key].shape != f["transmission"].shape:
+                    raise ValueError(
+                        f"'{key}' {f[key].shape} must have the shape of "
+                        f"'transmission' {f['transmission'].shape} (the target)"
+                    )
             if flat:
                 # Flat layout: one row per observation; nights are the distinct
                 # series_index values and may have different numbers of frames.
@@ -260,8 +284,9 @@ class TelluricDataModule(pl.LightningDataModule):
         """
         common = dict(
             h5_path=self.config.night_h5,
-            pool=self.stellar_pool,
+            pool=self.stellar_pool,                 # None for data.input: observed
             star_assignment=self.stellar_assignment,
+            observed_key=self.config.observed_key if self.observed_input else None,
             metadata_columns=tuple(self.config.metadata_columns),
             target_columns=self.config.resolved_target_columns,
             time_column=self.config.resolved_time_column,

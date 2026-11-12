@@ -680,3 +680,118 @@ class TestNoParameters:
         )
         trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
         assert trainer.state.status == "finished"
+
+
+# --------------------------------------------------------------------------- #
+# data.input: observed -- the file already holds the observed flux
+# --------------------------------------------------------------------------- #
+def _write_observed_flat_file(path, frames=FLAT_FRAMES, key="observed", bad_shape=False) -> None:
+    """Flat file with 'observed' (input) and 'transmission' (target), no stars."""
+    import h5py
+
+    _write_minimal_flat_file(path, frames)
+    with h5py.File(path, "a") as f:
+        trans = f["transmission"][:]
+        observed = (trans * (1.0 + 0.5 * np.sin(np.arange(N_WAVE)))[None, :]).astype(np.float32)
+        f.create_dataset(key, data=observed[:, :-1] if bad_shape else observed)
+
+
+def _observed_config(path, **kw) -> DataConfig:
+    return DataConfig(
+        night_h5=path, input="observed", metadata_columns=["airmass", "pwv"],
+        metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)}, **kw,
+    )
+
+
+class TestObservedInput:
+    def test_single_frame_manifests_default_to_tellurics(self) -> None:
+        for f in ("experiment_cnn_ae.yaml", "experiment_transformer_ae.yaml",
+                  "experiment_specpt.yaml"):
+            data = load_config(REPO / "experiments" / "single_frame" / f).data
+            assert data.input == "tellurics" and data.observed_key == "observed"
+
+    def test_full_setup_without_any_stellar_spectra(self, tmp_path) -> None:
+        """setup() runs with no phoenix_dir: no pool, no assignment, no audit CSV."""
+        import h5py
+        from tellurics.data.datamodule import TelluricDataModule
+
+        path = tmp_path / "obs.h5"
+        _write_observed_flat_file(path)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        dm.setup()
+        assert dm.stellar_pool is None and dm.stellar_assignment is None
+        assert not (tmp_path / "stellar_assignment.csv").exists()
+
+        with h5py.File(path, "r") as f:
+            observed, trans = f["observed"][:], f["transmission"][:]
+        ds = dm.train_ds
+        for i in range(len(ds)):
+            x = ds[i]
+            row = dm.night_rows[x["night_id"]][x["frame_id"]]
+            assert torch.allclose(x["observed"], torch.from_numpy(observed[row]))  # as stored
+            assert torch.allclose(x["telluric"], torch.from_numpy(trans[row]))     # target
+            assert "stellar" not in x and "star_index" not in x
+
+    def test_lightning_step_on_observed_data(self, tmp_path) -> None:
+        from tellurics.data.datamodule import TelluricDataModule
+
+        path = tmp_path / "obs.h5"
+        _write_observed_flat_file(path)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path,
+                                batch_size=4, num_workers=0, single_frame=True)
+        dm.setup()
+        loader = DataLoader(dm.train_ds, batch_size=4)
+        module = TelluricTrainingModule(
+            _tiny_for_n_wave("transformer_autoencoder"),
+            TrainingConfig(max_epochs=1, precision="32"),
+        )
+        trainer = pl.Trainer(
+            fast_dev_run=True, logger=False, enable_checkpointing=False,
+            enable_progress_bar=False, enable_model_summary=False,
+            accelerator="cpu", devices=1,
+        )
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        assert trainer.state.status == "finished"
+
+    def test_custom_observed_key(self, tmp_path) -> None:
+        from tellurics.data.datamodule import TelluricDataModule
+
+        path = tmp_path / "obs.h5"
+        _write_observed_flat_file(path, key="flux")
+        dm = TelluricDataModule(_observed_config(path, observed_key="flux"),
+                                run_dir=tmp_path, single_frame=True)
+        dm.setup()
+        assert len(dm.train_ds) > 0
+
+    def test_missing_observed_dataset_raises(self, tmp_path) -> None:
+        from tellurics.data.datamodule import TelluricDataModule
+
+        path = tmp_path / "obs.h5"
+        _write_minimal_flat_file(path)                      # no 'observed'
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        with pytest.raises(KeyError, match="observed"):
+            dm.setup()
+
+    def test_observed_must_match_transmission_shape(self, tmp_path) -> None:
+        from tellurics.data.datamodule import TelluricDataModule
+
+        path = tmp_path / "obs.h5"
+        _write_observed_flat_file(path, bad_shape=True)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        with pytest.raises(ValueError, match="shape"):
+            dm.setup()
+
+    def test_whole_night_model_rejects_observed_input(self) -> None:
+        raw = load_config(
+            REPO / "experiments" / "multiple_frames" / "experiment.yaml"
+        ).model_dump(mode="json")
+        raw["data"]["input"] = "observed"
+        with pytest.raises(ValidationError, match="stellar"):
+            ExperimentConfig(**raw)
+
+    def test_tellurics_input_still_needs_stars(self, tmp_path) -> None:
+        path = tmp_path / "flat.h5"
+        _write_flat_file(path)
+        with pytest.raises(ValueError, match="stellar pool"):
+            TelluricFrameDataset(night_ids=[0], h5_path=path, pool=None,
+                                 star_assignment=None, night_rows={0: np.array([0])})

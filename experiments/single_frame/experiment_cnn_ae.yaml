@@ -47,8 +47,16 @@ data:
   # observation) or (nights, T, 2048), wavelength (2048,), and labels with
   # series_index (flat layout), airmass and pwv. Stars on the same 2048 grid.
   night_h5: telluric_timeseries/telluric_templates_nights.h5
-  phoenix_dir: phoenix/convolved    # stellar *.fits pool
-  stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
+  # What night_h5 holds:
+  #   tellurics -- pure telluric transmission: every night gets a fixed star
+  #                from phoenix_dir and observed = transmission * star
+  #   observed  -- the observed flux is already in the file (dataset
+  #                observed_key); no stars are loaded, assigned or multiplied
+  # The target is always 'transmission'.
+  input: tellurics
+  observed_key: observed                 # used only with input: observed
+  phoenix_dir: phoenix/convolved         # stellar *.fits pool (input: tellurics only)
+  stellar_scale: true                    # normalize each stellar spectrum to unit mean flux (input: tellurics only)
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
   # Metadata fed to the model (order = metadata vector order); must match
   # model.metadata_dim. No time and no telluric parameters are read.

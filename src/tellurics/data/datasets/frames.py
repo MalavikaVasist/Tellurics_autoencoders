@@ -17,6 +17,12 @@ Two HDF5 layouts are supported:
 * **night-major**: ``transmission (n_nights, T, N)``, every night with the
   same ``T`` frames.
 
+Input: with ``data.input: tellurics`` the observed flux is built as
+``transmission * S`` with the night's fixed star; with ``data.input:
+observed`` it is read from the file (``observed_key``) and no stellar spectra
+are used (samples then carry no ``stellar`` / ``star_index``). The target is
+always ``transmission``.
+
 A sample containing a non-finite value raises instead of reaching the network.
 
 A batch is a set of observations (no frame axis)::
@@ -74,11 +80,12 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         target_columns: tuple[str, ...] | list[str] | None = None,
         night_rows: dict[int, np.ndarray] | None = None,
         time_column: str | None = TIME_COLUMN,
+        observed_key: str | None = None,
     ) -> None:
         super().__init__(
             night_ids, h5_path, pool, star_assignment, scaler,
             metadata_columns=metadata_columns, target_columns=target_columns,
-            time_column=time_column,
+            time_column=time_column, observed_key=observed_key,
         )
         self.flat = night_rows is not None
         if self.flat:
@@ -102,19 +109,23 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
 
     def __getitem__(self, idx: int) -> dict[str, object]:
         night, row, frame = self._index[int(idx)]
-        star_idx = int(self.star_assignment[night])                    # same star for the whole night
-        s, _ = self.pool[star_idx]                                     # (N,)
+        at = np.s_[row:row + 1] if self.flat else np.s_[night, frame:frame + 1]
 
         with self._open() as f:
             # read as (1, N) / (1, P): the scaler works on 2-D groups
-            if self.flat:
-                trans = np.asarray(f["transmission"][row:row + 1], np.float32)
-                lab = np.asarray(f["labels"][row:row + 1], np.float32)
-            else:
-                trans = np.asarray(f["transmission"][night, frame:frame + 1], np.float32)
-                lab = np.asarray(f["labels"][night, frame:frame + 1], np.float32)
+            trans = np.asarray(f["transmission"][at], np.float32)     # target T_tell
+            lab = np.asarray(f["labels"][at], np.float32)
+            if self.observed_key is not None:
+                # data.input: observed -- the file already holds the observed flux
+                observed = np.asarray(f[self.observed_key][at], np.float32)
 
-        if not (np.isfinite(trans).all() and np.isfinite(s).all()):
+        if self.observed_key is None:
+            # data.input: tellurics -- multiply by the night's fixed star
+            star_idx = int(self.star_assignment[night])                # same star for the whole night
+            s, _ = self.pool[star_idx]                                 # (N,)
+            observed = trans * s[None, :]                              # (1, N)
+
+        if not (np.isfinite(trans).all() and np.isfinite(observed).all()):
             where = f"row {row}" if self.flat else f"frame {frame}"
             raise ValueError(
                 f"non-finite values in night {night}, {where} of {self.h5_path}: "
@@ -122,7 +133,6 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
                 "(one row per real observation)"
             )
 
-        observed = trans * s[None, :]                                  # (1, N)
         metadata = lab[:, self._metadata_idx]                          # (1, M)
         if self.scaler is not None:
             metadata = self.scaler.transform_metadata(metadata)
@@ -141,13 +151,15 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
                 output_params = self.scaler.transform_params(output_params)
             theta["output_params"] = torch.from_numpy(output_params[0])    # (P,)
 
-        return {
+        sample = {
             "observed": torch.from_numpy(observed[0]),                 # (N,)
-            "stellar": torch.from_numpy(s),                            # (N,)
             "telluric": torch.from_numpy(trans[0]),                    # (N,)
             "wavelength": self.wavelength,                             # (N,)
             "theta": theta,
             "night_id": night,
             "frame_id": frame,
-            "star_index": star_idx,
         }
+        if self.observed_key is None:
+            sample["stellar"] = torch.from_numpy(s)                    # (N,)
+            sample["star_index"] = star_idx
+        return sample

@@ -102,14 +102,23 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         self,
         night_ids: list[int],
         h5_path: str | Path,
-        pool: StellarPool,
-        star_assignment: np.ndarray,
+        pool: StellarPool | None,
+        star_assignment: np.ndarray | None,
         scaler: ParameterScaler | None = None,
         metadata_columns: tuple[str, ...] | list[str] | None = None,
         target_columns: tuple[str, ...] | list[str] | None = None,
         time_column: str | None = TIME_COLUMN,
+        observed_key: str | None = None,
     ) -> None:
         super().__init__()
+        # observed_key set -> the file already holds the observed flux under
+        # that key (data.input: observed): no stars are assigned or multiplied.
+        self.observed_key = observed_key
+        if observed_key is None and (pool is None or star_assignment is None):
+            raise ValueError(
+                "pure-telluric data needs a stellar pool and a star assignment "
+                "(or set observed_key for files that already hold observed flux)"
+            )
         if metadata_columns is not None:
             self.metadata_columns = tuple(metadata_columns)
         if target_columns is not None:
@@ -118,7 +127,9 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         self.h5_path = Path(h5_path)
         self.night_ids = list(night_ids)
         self.pool = pool
-        self.star_assignment = np.asarray(star_assignment)
+        self.star_assignment = (
+            None if star_assignment is None else np.asarray(star_assignment)
+        )
         self.scaler = scaler
 
         # Resolve the column layout from the file's stored 'columns' attr.
@@ -179,6 +190,11 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
     def __getitem__(self, idx: int) -> dict[str, object]:
         night = self.night_ids[idx]
+        if self.observed_key is not None:
+            raise NotImplementedError(
+                "whole-night samples need the stellar spectrum: data.input: "
+                "observed is for the single-frame models"
+            )
         star_idx = int(self.star_assignment[night])
         s, _ = self.pool[star_idx]                    # (N,) float32
 

@@ -2,6 +2,8 @@ from pathlib import Path
 
 import math
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tellurics.config.parameters import (
@@ -18,7 +20,16 @@ class DataConfig(BaseModel):
     night_h5: Path = Path("telluric_timeseries/telluric_templates_nights.h5")
     phoenix_dir: Path = Path("phoenix/convolved")
 
-    stellar_scale: bool = True
+    # What the HDF5 holds:
+    #   "tellurics" -- pure telluric transmission (``transmission``); each
+    #       night gets a fixed PHOENIX star and observed = transmission * star.
+    #   "observed"  -- the observed flux is already in the file (under
+    #       ``observed_key``); no stellar spectra are loaded or assigned and
+    #       nothing is multiplied. ``transmission`` is still the target.
+    input: Literal["tellurics", "observed"] = "tellurics"
+    observed_key: str = "observed"          # HDF5 dataset of the observed flux (input: observed)
+
+    stellar_scale: bool = True              # input: tellurics only
     scale_metadata: bool = True
     # Label columns fed to the model as metadata (order = metadata vector
     # order). Default: pressure, temperature, humidity; the single-frame

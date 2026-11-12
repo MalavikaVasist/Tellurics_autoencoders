@@ -63,6 +63,16 @@ class ExperimentConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _whole_night_model_needs_stars(self) -> "ExperimentConfig":
+        """The whole-night model takes the stellar spectrum as an input."""
+        if not self.model.single_frame and self.data.input == "observed":
+            raise ValueError(
+                f"model {self.model.architecture.value} needs the stellar "
+                "spectrum as an input: use data.input: tellurics"
+            )
+        return self
+
 
 def load_config(path: str | Path | None) -> ExperimentConfig:
     """
