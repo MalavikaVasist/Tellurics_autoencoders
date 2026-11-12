@@ -4,7 +4,8 @@ Used by the per-observation models (``cnn_autoencoder``,
 ``transformer_autoencoder``, ``specpt``): one observation in, one telluric
 spectrum out. The exposures of all nights of a split are pooled. It reads the same night-major HDF5 as
 :class:`~tellurics.data.datasets.timeseries.TelluricTimeseriesDataset` and
-keeps its whole contract (column checks, scaling, star-per-night), but indexes
+keeps its input/target/metadata handling (column checks, metadata scaling,
+star-per-night, noise), but indexes
 ``(night, frame)`` pairs, so the train/val/test split stays *night-level*: no
 exposure of a validation or test night is ever seen in training.
 
@@ -32,12 +33,13 @@ served R times per epoch, each pass with a new noise realization
 
 A sample containing a non-finite value raises instead of reaching the network.
 
+No time and no telluric parameters are read: the single-frame models use
+neither (only the whole-night model needs exposure times).
+
 A batch is a set of observations (no frame axis)::
 
     observed (B, N)   stellar (B, N)   telluric (B, N)   wavelength (B, N)
     theta.metadata (B, M)
-    (+ theta.time (B,) / theta.output_params (B, P) only when a time column /
-    parameter columns are configured -- never for the single-frame configs)
 
 and the same training module / loss works unchanged (MSE over (B, N)).
 """
@@ -49,7 +51,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tellurics.config.parameters import TIME_COLUMN
 from tellurics.data.datasets.timeseries import TelluricTimeseriesDataset
 from tellurics.data.scaling import ParameterScaler
 from tellurics.data.stellar import StellarPool
@@ -69,7 +70,7 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         n_frames: Night-major layout: exposures per night ``T``.
         night_rows: Flat layout: ``{night: row indices}`` -- the rows of the
             flat arrays that belong to each night (any number per night).
-        scaler: Optional ``[0, 1]`` label scaler (as for the night dataset).
+        scaler: Optional ``[0, 1]`` metadata scaler (metadata group only).
 
     Returns the dict of :class:`TelluricTimeseriesDataset` without the frame
     axis, plus ``frame_id`` (index of the exposure within its night).
@@ -84,9 +85,7 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         n_frames: int | None = None,
         scaler: ParameterScaler | None = None,
         metadata_columns: tuple[str, ...] | list[str] | None = None,
-        target_columns: tuple[str, ...] | list[str] | None = None,
         night_rows: dict[int, np.ndarray] | None = None,
-        time_column: str | None = TIME_COLUMN,
         observed_key: str | None = None,
         noise_level_mean: float = 0.0,
         noise_level_std: float = 0.0,
@@ -97,8 +96,9 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
     ) -> None:
         super().__init__(
             night_ids, h5_path, pool, star_assignment, scaler,
-            metadata_columns=metadata_columns, target_columns=target_columns,
-            time_column=time_column, observed_key=observed_key,
+            # single frames: metadata only -- no time, no telluric parameters
+            metadata_columns=metadata_columns, target_columns=(),
+            time_column=None, observed_key=observed_key,
             noise_level_mean=noise_level_mean, noise_level_std=noise_level_std,
             noise_seed=noise_seed, has_target=has_target,
             target_key=target_key, repeats=repeats,
@@ -141,19 +141,6 @@ class TelluricFrameDataset(TelluricTimeseriesDataset):
         if self.scaler is not None:
             metadata = self.scaler.transform_metadata(metadata)
         theta = {"metadata": torch.from_numpy(metadata[0])}            # (M,)
-
-        # time / telluric parameters only when configured (whole-night style
-        # configs with param_bounds); single-frame configs read neither.
-        if self._time_idx is not None:
-            time = lab[:, [self._time_idx]]                            # (1, 1)
-            if self.scaler is not None:
-                time = self.scaler.transform_time(time)
-            theta["time"] = torch.tensor(time[0, 0], dtype=torch.float32)   # ()
-        if self._target_idx:
-            output_params = lab[:, self._target_idx]                   # (1, P)
-            if self.scaler is not None:
-                output_params = self.scaler.transform_params(output_params)
-            theta["output_params"] = torch.from_numpy(output_params[0])    # (P,)
 
         sample = {
             "observed": torch.from_numpy(observed[0]),                 # (N,)

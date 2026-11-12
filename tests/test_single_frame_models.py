@@ -387,7 +387,7 @@ class TestFrameDataset:
         assert sample["observed"].shape == (N_WAVE,)
         assert sample["telluric"].shape == (N_WAVE,)
         assert sample["stellar"].shape == (N_WAVE,)
-        assert sample["theta"]["time"].shape == ()
+        assert set(sample["theta"]) == {"metadata"}                   # no time, no parameters
         assert sample["theta"]["metadata"].shape == (M,)              # airmass, pwv
         assert sample["wavelength"].shape == (N_WAVE,)
         assert torch.allclose(sample["observed"], sample["telluric"] * sample["stellar"])
@@ -490,8 +490,8 @@ def _flat_datamodule(path, tmp_path, single_frame=True):
     from tests._bounds import BOUNDS
 
     config = DataConfig(
-        night_h5=path, param_bounds={**BOUNDS, "pwv": (0.0, 25.0)},
-        metadata_columns=["airmass", "pwv"],
+        night_h5=path, metadata_columns=["airmass", "pwv"],
+        metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)},
     )
     module = TelluricDataModule(config, run_dir=tmp_path, single_frame=single_frame)
     module._load_metadata()
@@ -623,6 +623,17 @@ class TestNoParameters:
         assert data.resolved_target_columns == () and data.resolved_time_column is None
         assert set(data.bounds) == {"airmass", "PWV"}
 
+    def test_single_frame_models_reject_param_bounds(self) -> None:
+        from tests._bounds import BOUNDS
+        raw = load_config(
+            REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
+        ).model_dump(mode="json")
+        raw["data"]["metadata_bounds"] = None
+        raw["data"]["param_bounds"] = {**{k: list(v) for k, v in BOUNDS.items()}, "pwv": [0, 25]}
+        raw["data"]["metadata_columns"] = ["airmass", "pwv"]
+        with pytest.raises(ValidationError, match="metadata_bounds"):
+            ExperimentConfig(**raw)
+
     def test_whole_night_manifest_keeps_parameters_and_time(self) -> None:
         data = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml").data
         assert data.param_bounds is not None and len(data.resolved_target_columns) == 16
@@ -661,8 +672,6 @@ class TestNoParameters:
             night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
             star_assignment=np.array([0, 1, 2]), night_rows=dm.night_rows, scaler=scaler,
             metadata_columns=("airmass", "pwv"),
-            target_columns=config.resolved_target_columns,
-            time_column=config.resolved_time_column,
         )
         x = ds[0]
         assert set(x["theta"]) == {"metadata"}            # no time, no parameters

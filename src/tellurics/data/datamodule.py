@@ -185,6 +185,11 @@ class TelluricDataModule(pl.LightningDataModule):
 
     def _load_metadata(self) -> None:
         """Read the shapes and the wavelength grid."""
+        if self.single_frame and self.config.param_bounds is not None:
+            raise ValueError(
+                "single-frame models read only metadata: give data.metadata_bounds "
+                "instead of data.param_bounds"
+            )
         night_h5 = Path(self.config.night_h5)
         if not night_h5.exists():
             raise FileNotFoundError(
@@ -318,13 +323,16 @@ class TelluricDataModule(pl.LightningDataModule):
             star_assignment=self.stellar_assignment,
             observed_key=self.config.observed_key if self.observed_input else None,
             metadata_columns=tuple(self.config.metadata_columns),
-            target_columns=self.config.resolved_target_columns,
-            time_column=self.config.resolved_time_column,
             target_key=self.config.target_key,
         )
         logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
         dataset_cls = TelluricTimeseriesDataset
-        if self.single_frame:
+        if not self.single_frame:
+            # whole night: also exposure times (and parameters, analysis only)
+            common["target_columns"] = self.config.resolved_target_columns
+            common["time_column"] = self.config.resolved_time_column
+        else:
+            # single frames read metadata only: no time, no parameters
             dataset_cls = TelluricFrameDataset
             if self.night_rows is not None:
                 common["night_rows"] = self.night_rows      # flat: any frames per night
@@ -400,7 +408,6 @@ class TelluricDataModule(pl.LightningDataModule):
                 h5_path=source.night_h5, pool=None, star_assignment=None,
                 scaler=scaler, observed_key=source.observed_key, has_target=False,
                 metadata_columns=tuple(self.config.metadata_columns),
-                target_columns=(), time_column=self.config.resolved_time_column,
             )
             if self.single_frame:
                 if layout["flat"]:
@@ -414,7 +421,10 @@ class TelluricDataModule(pl.LightningDataModule):
                         f"data.real '{source.name}' is flat: the whole-night "
                         "model needs the night-major (n_nights, T, N) layout"
                     )
-                ds = TelluricTimeseriesDataset(**common)
+                ds = TelluricTimeseriesDataset(
+                    **common, target_columns=(),
+                    time_column=self.config.resolved_time_column,
+                )
             self.real_ds[source.name] = ds
             logger.info(f"real observations '{source.name}': {len(ds)} samples")
 

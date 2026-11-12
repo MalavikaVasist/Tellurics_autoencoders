@@ -64,6 +64,17 @@ class ExperimentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _single_frame_models_use_metadata_bounds(self) -> "ExperimentConfig":
+        """Single-frame models read only metadata: no time, no parameters."""
+        if self.model.single_frame and self.data.param_bounds is not None:
+            raise ValueError(
+                f"model {self.model.architecture.value} reads only metadata: "
+                "replace data.param_bounds with data.metadata_bounds (bounds "
+                "for data.metadata_columns only)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _stellar_input_matches_the_data(self) -> "ExperimentConfig":
         """The whole-night model's stellar input needs stars in the data.
 
