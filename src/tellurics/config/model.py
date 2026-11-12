@@ -5,23 +5,20 @@ classes below, selected by its ``architecture`` value (a pydantic
 discriminated union, :data:`AnyModelConfig`). Each experiment therefore only
 states the fields of its own model:
 
-=============================  ==============================  ===============
-``architecture``               config class                    sample
-=============================  ==============================  ===============
-``neural_telluric_predictor``  :class:`ModelConfig`            whole night
-``cnn_autoencoder``            :class:`CNNAutoencoderConfig`   single frame
-``transformer_autoencoder``    :class:`TransformerAutoencoderConfig`  single frame
-``specpt``                     :class:`SpecPTConfig`           single frame
-=============================  ==============================  ===============
+===========================  =====================================
+``architecture``             config class
+===========================  =====================================
+``cnn_autoencoder``          :class:`CNNAutoencoderConfig`
+``transformer_autoencoder``  :class:`TransformerAutoencoderConfig`
+``specpt``                   :class:`SpecPTConfig`
+===========================  =====================================
 
-``single_frame`` (a class constant) tells the training script which dataset
-to build: whole nights ``(B, T, N)`` for the whole-night model, or single
-observations ``(B, N)`` -- the exposures of all nights pooled -- for the
-per-observation models.
+Every model takes one observation and returns one telluric spectrum:
+``observed (B, N)`` (+ metadata ``(B, M)``) -> ``telluric (B, N)``.
 """
 
 from enum import Enum
-from typing import Annotated, ClassVar, Literal, Union
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
 
@@ -29,7 +26,6 @@ from pydantic import BaseModel, Field
 class ModelArchitecture(str, Enum):
     """Available model architectures (``ModelRegistry`` ids)."""
 
-    NEURAL_TELLURIC_PREDICTOR = "neural_telluric_predictor"
     CNN_AUTOENCODER = "cnn_autoencoder"
     TRANSFORMER_AUTOENCODER = "transformer_autoencoder"
     SPECPT = "specpt"
@@ -38,8 +34,8 @@ class ModelArchitecture(str, Enum):
 class TelluricActivation(str, Enum):
     """Output activation of the telluric head (only the spectrum prediction).
 
-    ``telluric_pred`` has shape ``(B, T, N)`` and holds the telluric
-    transmission of every exposure on the full wavelength grid. Transmission
+    ``telluric_pred`` has shape ``(B, N)``: the telluric transmission of each
+    observation on the full wavelength grid. Transmission
     is physical in ``[0, 1]`` and is never rescaled by the data pipeline:
 
     * ``OPTICAL_DEPTH`` -- ``T = exp(-softplus(z))``: the head predicts an
@@ -53,96 +49,8 @@ class TelluricActivation(str, Enum):
     NONE = "none"
 
 
-class ModelConfig(BaseModel):
-    """Configuration for the whole-night telluric time-series estimator.
-
-    No field carries a default: every value is a design or data decision and
-    must be stated by the manifest (see ``experiments/multiple_frames/``).  All fields are
-    consumed by :mod:`tellurics.models.multiple_frames.predictor`; see that module's docstring for
-    the shape-annotated data flow.
-    """
-
-    single_frame: ClassVar[bool] = False
-
-    architecture: Literal[ModelArchitecture.NEURAL_TELLURIC_PREDICTOR]
-
-    # -- problem dimensions (must match the DataModule contract) ---------- #
-    num_wavelength_bins: int = Field(gt=0)
-    n_frames_per_series: int = Field(gt=0, description="Exposures per night (T).")
-    metadata_dim: int = Field(
-        gt=0,
-        description="Per-exposure metadata width P (data contract: 3 -> "
-                    "pressure, temperature, humidity).",
-    )
-    use_stellar: bool = Field(
-        default=True,
-        description="Feed the night's stellar spectrum through the "
-                    "StellarEncoder into the fusion. False for observed-flux "
-                    "data (data.observed_key set) and real observations, "
-                    "which carry no separate stellar spectrum.",
-    )
-
-    # -- architecture geometry -------------------------------------------- #
-    num_queries: int = Field(gt=0, description="Number of learned Perceiver latents (Q).")
-    spectral_latent_dim: int = Field(
-        gt=0, description="Dim of the per-exposure spectral code (d)."
-    )
-    num_heads: int = Field(
-        gt=0, description="Heads of the temporal cross-attention."
-    )
-    dropout: float = Field(ge=0.0, lt=1.0)
-
-    # -- shared strided 1D-CNN over each exposure of X -------------------- #
-    x_encoder_channels: list[int] = Field(
-        description="Channels of the shared strided 1D-CNN applied to each exposure of X.",
-    )
-    x_encoder_kernel: int = Field(gt=0)
-    x_encoder_stride: int = Field(gt=0)
-    s_encoder_channels: list[int] = Field(
-        description="Channels of the independent stellar (S) 1D-CNN.",
-    )
-    s_encoder_kernel: int = Field(gt=0)
-    s_encoder_stride: int = Field(gt=0)
-    encoder_pool_bins: int = Field(
-        gt=0,
-        description="Adaptive spectral bins kept per channel before the code read-out.",
-    )
-    fusion_hidden: int = Field(
-        ge=0,
-        description="Fusion MLP width. 0 -> num_queries * spectral_latent_dim.",
-    )
-    fusion_layers: int = Field(gt=0)
-    metadata_enc_dim: int = Field(
-        gt=0,
-        description="Width of the per-exposure metadata code (C), concatenated "
-                    "with the spectral code before the temporal Perceiver.",
-    )
-    metadata_enc_hidden: int | None = Field(
-        gt=0,
-        description="Hidden width of the per-exposure metadata encoder MLP "
-                    "(None -> auto).",
-    )
-    time_enc_dim: int = Field(
-        gt=0,
-        description="Width (k) of the per-exposure time code produced by the "
-                    "TimeEncoder from continuous exposure times (time_hours), "
-                    "concatenated with the spectral + metadata codes before "
-                    "the temporal Perceiver.",
-    )
-    telluric_decoder_hidden: int | None = Field(
-        gt=0,
-        description="Hidden width of the per-exposure telluric-decoder MLP "
-                    "(None -> 2 * spectral_latent_dim).",
-    )
-    telluric_activation: TelluricActivation = Field(
-        description="Activation applied to the telluric head output only "
-                    "(see TelluricActivation). 'optical_depth' keeps the "
-                    "predicted transmission in (0, 1].",
-    )
-
-
 # =========================================================================== #
-# Single-frame models:  observed (B, 1, N) -> flatten (B, N) -> telluric (B, 1, N)
+# Single-frame models:  observed (B, N) -> telluric (B, N)
 # =========================================================================== #
 class _SingleFrameConfig(BaseModel):
     """Fields shared by every per-observation autoencoder.
@@ -152,8 +60,6 @@ class _SingleFrameConfig(BaseModel):
     batch is ``observed (B, N)`` + ``metadata (B, M)``, and the model returns
     ``telluric (B, N)`` -- one spectrum per observation.
     """
-
-    single_frame: ClassVar[bool] = True
 
     num_wavelength_bins: int = Field(gt=0, description="Spectral samples N.")
 
@@ -169,7 +75,7 @@ class _MetadataConditionedConfig(_SingleFrameConfig):
 
     The metadata vector (``data.metadata_columns``, e.g. airmass + PWV) is
     encoded by the shared :class:`~tellurics.models.metadata.MetadataEncoder`
-    and joined to the spectral input, as in the whole-night model.
+    and joined to the spectral input.
     """
 
     metadata_dim: int = Field(
@@ -261,7 +167,6 @@ class SpecPTConfig(_SingleFrameConfig):
 
 AnyModelConfig = Annotated[
     Union[
-        ModelConfig,
         CNNAutoencoderConfig,
         TransformerAutoencoderConfig,
         SpecPTConfig,

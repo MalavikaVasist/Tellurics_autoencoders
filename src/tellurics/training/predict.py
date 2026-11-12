@@ -4,10 +4,10 @@ Used after training (``tellurics.scripts.train``) and by
 ``train --predict CKPT`` for a trained checkpoint. For every ``data.real``
 file it writes ``<run_dir>/predictions/<name>.h5`` with::
 
-    telluric_pred  (n, N) single-frame models / (n, T, N) whole-night model
-    observed       same shape: the input the model saw
+    telluric_pred  (n, N) one telluric spectrum per observation
+    observed       (n, N) the input the model saw
     night_id       (n,)   night (series) position within the file
-    frame_id       (n,)   frame within the night (single-frame models only)
+    frame_id       (n,)   frame within the night
     wavelength     (N,)
 """
 

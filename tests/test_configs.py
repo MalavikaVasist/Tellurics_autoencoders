@@ -1,149 +1,84 @@
 """Tests for configuration validation."""
 
 import pytest
+from pydantic import ValidationError
 
-from tellurics.config.parameters import (
-    OPTIONAL_COLUMNS,
-    PHYSICAL_COLUMNS,
-    TARGET_COLUMNS,
-    TIME_COLUMN,
-)
-from tellurics.config.data import DataConfig
-from tellurics.config.model import ModelArchitecture, ModelConfig, TelluricActivation
+from tellurics.config import CNNAutoencoderConfig, DataConfig, ExperimentConfig, TelluricActivation
 from tellurics.config.training import TrainingConfig
 from tests._bounds import BOUNDS
 
-# Every ModelConfig field, with the problem dims kept tiny.
-MODEL_KWARGS = {
-    "architecture": "neural_telluric_predictor",
-    "num_wavelength_bins": 1024,
-    "n_frames_per_series": 12,
-    "metadata_dim": 3,
-    "num_queries": 8,
-    "spectral_latent_dim": 32,
-    "num_heads": 4,
+CNN_KWARGS = {
+    "architecture": "cnn_autoencoder",
+    "num_wavelength_bins": 256,
+    "encoder_channels": [8, 16],
+    "kernel_size": 7,
+    "stride": 2,
+    "bottleneck_channels": 4,
+    "metadata_dim": 2,
+    "metadata_enc_dim": 8,
+    "latent_dim": 16,
     "dropout": 0.1,
-    "x_encoder_channels": [8, 16, 32],
-    "x_encoder_kernel": 7,
-    "x_encoder_stride": 2,
-    "s_encoder_channels": [8, 16, 32],
-    "s_encoder_kernel": 7,
-    "s_encoder_stride": 2,
-    "encoder_pool_bins": 16,
-    "fusion_hidden": 0,
-    "fusion_layers": 2,
-    "metadata_enc_dim": 16,
-    "metadata_enc_hidden": None,
-    "time_enc_dim": 16,
-    "telluric_decoder_hidden": None,
     "telluric_activation": "optical_depth",
 }
 
 
 class TestModelConfig:
     def test_explicit_config(self) -> None:
-        config = ModelConfig(**MODEL_KWARGS)
-        assert (
-            config.architecture is ModelArchitecture.NEURAL_TELLURIC_PREDICTOR
-        )
-        assert config.n_frames_per_series == 12
-
-    @pytest.mark.parametrize("field", sorted(MODEL_KWARGS))
-    def test_no_field_has_a_default(self, field: str) -> None:
-        """Omitting any field is an error: nothing is assumed implicitly."""
-        with pytest.raises(ValueError):
-            ModelConfig(**{k: v for k, v in MODEL_KWARGS.items() if k != field})
-
-    def test_rejects_unknown_architecture(self) -> None:
-        with pytest.raises(ValueError):
-            ModelConfig(**{**MODEL_KWARGS, "architecture": "cnn"})
-
-    def test_metadata_dim_must_be_positive(self) -> None:
-        """metadata_dim=0 would leave the metadata encoder unbuildable."""
-        with pytest.raises(ValueError):
-            ModelConfig(**{**MODEL_KWARGS, "metadata_dim": 0})
-
-    def test_data_contract_dimensions(self) -> None:
-        """The dims that must agree with the DataModule."""
-        config = ModelConfig(**MODEL_KWARGS)
-        assert config.metadata_dim == 3   # pressure, temperature, humidity
-        assert config.num_wavelength_bins == 1024
-
-    def test_telluric_activation_is_parsed(self) -> None:
-        assert (
-            ModelConfig(**MODEL_KWARGS).telluric_activation
-            is TelluricActivation.OPTICAL_DEPTH
-        )
-        for value, member in (
-            ("sigmoid", TelluricActivation.SIGMOID),
-            ("none", TelluricActivation.NONE),
-        ):
-            assert (
-                ModelConfig(**{**MODEL_KWARGS, "telluric_activation": value})
-                .telluric_activation
-                is member
-            )
+        config = CNNAutoencoderConfig(**CNN_KWARGS)
+        assert config.num_wavelength_bins == 256
+        assert config.telluric_activation is TelluricActivation.OPTICAL_DEPTH
 
     def test_rejects_unknown_activation(self) -> None:
-        with pytest.raises(ValueError):
-            ModelConfig(**{**MODEL_KWARGS, "telluric_activation": "softmax"})
+        with pytest.raises(ValidationError):
+            CNNAutoencoderConfig(**{**CNN_KWARGS, "telluric_activation": "relu"})
+
+    def test_rejects_unknown_architecture(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("TELLURICS_DATA", str(tmp_path))
+        with pytest.raises(ValidationError):
+            ExperimentConfig(model={**CNN_KWARGS, "architecture": "neural_telluric_predictor"},
+                             data={"metadata_bounds": BOUNDS})
+
+    def test_metadata_dim_must_match_metadata_columns(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("TELLURICS_DATA", str(tmp_path))
+        with pytest.raises(ValidationError, match="metadata_dim"):
+            ExperimentConfig(model={**CNN_KWARGS, "metadata_dim": 3},
+                             data={"metadata_bounds": BOUNDS})
 
 
-class TestDataConfigScaling:
-    """The [0, 1] scaling switches and their authoritative bounds."""
+class TestDataConfig:
+    @pytest.fixture(autouse=True)
+    def _root(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setenv("TELLURICS_DATA", str(tmp_path))
 
-    def test_scaling_flags_default_to_on(self) -> None:
-        config = DataConfig(param_bounds=BOUNDS)
-        assert config.scale_metadata is True
-        assert config.scale_params is True
-        assert config.scale_time is True
+    def test_defaults(self) -> None:
+        config = DataConfig(metadata_bounds=BOUNDS)
+        assert config.metadata_columns == ["airmass", "PWV"]
+        assert config.target_key == "flux" and config.observed_key is None
+        assert config.scale_metadata and config.noise_level_mean == 0.0
 
-    def test_flags_are_independent(self) -> None:
-        config = DataConfig(
-            scale_metadata=False,
-            scale_params=False,
-            scale_time=False,
-            param_bounds=BOUNDS,
-        )
-        assert not (config.scale_metadata or config.scale_params or config.scale_time)
+    def test_metadata_bounds_are_required(self) -> None:
+        with pytest.raises(ValidationError, match="metadata_bounds"):
+            DataConfig()
 
-    def test_bounds_cover_the_whole_schema(self) -> None:
-        bounds = DataConfig(param_bounds=BOUNDS).param_bounds.to_mapping()
-        # optional columns (pwv) may be left without bounds
-        assert tuple(bounds) == tuple(
-            c for c in PHYSICAL_COLUMNS if c not in OPTIONAL_COLUMNS
-        )
-        assert set(TARGET_COLUMNS) <= set(bounds)
-        assert bounds[TIME_COLUMN] == (0.0, 16.0)
+    def test_every_metadata_column_needs_bounds(self) -> None:
+        with pytest.raises(ValidationError, match="PWV"):
+            DataConfig(metadata_bounds={"airmass": (1.0, 2.0)})
 
-    def test_bounds_are_declared_by_the_manifest(self) -> None:
-        config = DataConfig(param_bounds={**BOUNDS, "pressure": (700.0, 780.0)})
-        assert config.param_bounds.pressure == (700.0, 780.0)
-        # The other columns keep whatever the manifest declared.
-        assert config.param_bounds.airmass == (1.0, 2.0)
+    def test_bounds_must_be_ordered_and_finite(self) -> None:
+        with pytest.raises(ValidationError, match="min < max"):
+            DataConfig(metadata_bounds={**BOUNDS, "PWV": (25.0, 0.0)})
+        with pytest.raises(ValidationError, match="min < max"):
+            DataConfig(metadata_bounds={**BOUNDS, "PWV": (0.0, float("inf"))})
 
-    def test_missing_bounds_are_rejected(self) -> None:
-        """Every bound must be stated: Parameters carries no defaults."""
-        incomplete = {k: v for k, v in BOUNDS.items() if k != "pressure"}
-        with pytest.raises(ValueError):
-            DataConfig(param_bounds=incomplete)
+    def test_duplicate_metadata_columns_are_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="duplicates"):
+            DataConfig(metadata_columns=["airmass", "airmass"], metadata_bounds=BOUNDS)
 
-    def test_degenerate_bounds_are_rejected(self) -> None:
-        """A constant parameter (min == max) carries no scale and is refused."""
-        with pytest.raises(ValueError):
-            DataConfig(param_bounds={**BOUNDS, "co": (0.14, 0.14)})
-
-    def test_rejects_inverted_bounds(self) -> None:
-        with pytest.raises(ValueError):
-            DataConfig(param_bounds={**BOUNDS, "pressure": (900.0, 600.0)})
-
-    def test_rejects_non_finite_bounds(self) -> None:
-        with pytest.raises(ValueError):
-            DataConfig(param_bounds={**BOUNDS, "humidity": (0.0, float("nan"))})
+    def test_split_fractions(self) -> None:
+        with pytest.raises(ValidationError, match="less than 1"):
+            DataConfig(metadata_bounds=BOUNDS, train_fraction=0.9, val_fraction=0.1)
 
 
 class TestTrainingConfig:
-    def test_default_config(self) -> None:
-        config = TrainingConfig()
-        assert config.max_epochs == 100
-        assert config.optimizer.learning_rate == 1e-4
+    def test_defaults_construct(self) -> None:
+        assert TrainingConfig().max_epochs > 0

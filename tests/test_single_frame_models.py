@@ -26,18 +26,17 @@ from torch.utils.data import DataLoader
 from tellurics.config import (
     CNNAutoencoderConfig,
     ExperimentConfig,
-    ModelConfig,
     SpecPTConfig,
     TransformerAutoencoderConfig,
     load_config,
 )
 from tellurics.config.data import DataConfig
 from tellurics.config.training import TrainingConfig
-from tellurics.data.datasets import TelluricFrameDataset, TelluricTimeseriesDataset
+from tellurics.data.datasets import TelluricFrameDataset
 from tellurics.models import CNNAutoencoder, SpecPT, TransformerAutoencoder
 from tellurics.training.module import TelluricTrainingModule
 from tellurics.utils.registry import ModelRegistry
-from tests.test_scaling import N_FRAMES, N_WAVE, _FakeStellarPool, _write_night_file
+from tests._fixtures import LABEL_COLUMNS, N_FRAMES, N_WAVE, _FakeStellarPool, _write_night_file
 
 REPO = Path(__file__).resolve().parents[1]
 N = 1000   # small, deliberately not a power of two (exercises padding/cropping)
@@ -109,23 +108,17 @@ def _run(model, observed, metadata, wavelength):
 # --------------------------------------------------------------------------- #
 class TestConfigs:
     @pytest.mark.parametrize(
-        "fname, cls, per_frame",
+        "fname, cls",
         [
-            ("multiple_frames/experiment.yaml", ModelConfig, False),
-            ("single_frame/experiment_cnn_ae.yaml", CNNAutoencoderConfig, True),
-            ("single_frame/experiment_transformer_ae.yaml", TransformerAutoencoderConfig, True),
-            ("single_frame/experiment_specpt.yaml", SpecPTConfig, True),
+            ("single_frame/experiment_cnn_ae.yaml", CNNAutoencoderConfig),
+            ("single_frame/experiment_transformer_ae.yaml", TransformerAutoencoderConfig),
+            ("single_frame/experiment_specpt.yaml", SpecPTConfig),
         ],
     )
-    def test_each_manifest_selects_its_own_model_config(
-        self, fname, cls, per_frame
-    ) -> None:
+    def test_each_manifest_selects_its_own_model_config(self, fname, cls) -> None:
         cfg = load_config(REPO / "experiments" / fname)
         assert type(cfg.model) is cls
-        # whole nights for the whole-night model, single observations otherwise
-        assert cfg.model.single_frame is per_frame
-        # whole night: full 51557 grid; per-observation models: 2048-sample data
-        assert cfg.model.num_wavelength_bins == (2048 if per_frame else 51557)
+        assert cfg.model.num_wavelength_bins == 2048
 
     @pytest.mark.parametrize(
         "fname", ["single_frame/experiment_cnn_ae.yaml",
@@ -135,13 +128,7 @@ class TestConfigs:
         cfg = load_config(REPO / "experiments" / fname)
         assert cfg.data.metadata_columns == ["airmass", "PWV"]
         assert cfg.model.metadata_dim == 2
-        assert cfg.data.param_bounds is None
         assert cfg.data.metadata_bounds == {"airmass": (1.0, 2.0), "PWV": (0.0, 25.0)}
-
-    def test_whole_night_keeps_its_three_metadata_columns(self) -> None:
-        cfg = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml")
-        assert cfg.data.metadata_columns == ["pressure", "temperature", "humidity"]
-        assert cfg.model.metadata_dim == 3
 
     def test_metadata_dim_must_match_metadata_columns(self) -> None:
         raw = load_config(
@@ -159,12 +146,12 @@ class TestConfigs:
         with pytest.raises(ValidationError, match="PWV"):
             ExperimentConfig(**raw)
 
-    def test_exactly_one_bounds_block(self) -> None:
+    def test_metadata_bounds_are_required(self) -> None:
         raw = load_config(
             REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
         ).model_dump(mode="json")
         raw["data"]["metadata_bounds"] = None
-        with pytest.raises(ValidationError, match="exactly one"):
+        with pytest.raises(ValidationError, match="metadata_bounds"):
             ExperimentConfig(**raw)
 
     def test_metadata_bounds_must_be_ordered(self) -> None:
@@ -179,21 +166,13 @@ class TestConfigs:
         from tellurics.scripts.train import apply_overrides
         cfg = load_config(REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml")
         cfg = apply_overrides(cfg, ["model.latent_dim=64", "training.batch_size=16"])
-        assert cfg.model.latent_dim == 64 and cfg.data.param_bounds is None
-
-    def test_manifest_folders_mirror_the_model_packages(self) -> None:
-        """multiple_frames/ -> whole-night model, single_frame/ -> per-frame models."""
-        for folder, per_frame in (("multiple_frames", False), ("single_frame", True)):
-            manifests = sorted((REPO / "experiments" / folder).glob("*.yaml"))
-            assert manifests, folder
-            for path in manifests:
-                assert load_config(path).model.single_frame is per_frame, path.name
+        assert cfg.model.latent_dim == 64 and cfg.training.batch_size == 16
 
     def test_runs_do_not_share_a_run_dir(self) -> None:
-        names = ["multiple_frames/experiment", "single_frame/experiment_cnn_ae",
+        names = ["single_frame/experiment_cnn_ae",
                  "single_frame/experiment_transformer_ae", "single_frame/experiment_specpt"]
         dirs = {load_config(REPO / "experiments" / f"{n}.yaml").run_dir for n in names}
-        assert len(dirs) == 4
+        assert len(dirs) == 3
 
     def test_fields_of_another_architecture_are_rejected(self) -> None:
         """A CNN config must not silently accept transformer fields."""
@@ -223,8 +202,7 @@ class TestSingleFrameModels:
         model = _model(arch).eval()
         x, m, wl = _inputs(3)
         with torch.no_grad():
-            out = model(x, stellar=torch.rand(3, N), metadata=m,
-                        time=torch.rand(3), wavelength=wl)
+            out = model(x, metadata=m, wavelength=wl)
             shared = model(x, metadata=m, wavelength=wl[0])        # (N,) grid
         assert out.telluric.shape == (3, N)                         # (B, N)
         assert torch.allclose(out.telluric, shared.telluric, atol=1e-6)
@@ -393,15 +371,17 @@ class TestFrameDataset:
         assert torch.allclose(sample["observed"], sample["telluric"] * sample["stellar"])
 
     def test_matches_the_corresponding_night_frame(self, night_file) -> None:
-        night = TelluricTimeseriesDataset(
-            [1], night_file, _FakeStellarPool(), np.zeros(8, dtype=int),
-            metadata_columns=("airmass", "pwv"),
-        )[0]
+        import h5py
         frame = _frames(night_file, [1])[2]
-        for key in ("observed", "telluric"):
-            assert torch.equal(frame[key], night[key][2])
-        assert torch.equal(frame["theta"]["metadata"], night["theta"]["metadata"][2])
-        assert torch.equal(frame["wavelength"], night["wavelength"])
+        with h5py.File(night_file) as f:
+            flux = f["flux"][1, 2]
+            cols = [c.decode() for c in f["labels"].attrs["columns"]]
+            labels = f["labels"][1, 2]
+        assert (frame["night_id"], frame["frame_id"]) == (1, 2)
+        assert np.array_equal(frame["telluric"].numpy(), flux)
+        assert np.allclose(frame["observed"].numpy(), flux * _FakeStellarPool().spectrum)
+        assert np.allclose(frame["theta"]["metadata"].numpy(),
+                           labels[[cols.index("airmass"), cols.index("pwv")]])
 
     def test_metadata_columns_are_selectable(self, night_file) -> None:
         """airmass, pwv by name -- and the default three still work."""
@@ -463,9 +443,7 @@ class _DistinctStars:
 def _write_flat_file(path, frames=FLAT_FRAMES, nan_row: int | None = None) -> None:
     """flux (n_obs, N), labels (n_obs, P) with series_index; rows shuffled."""
     import h5py
-    from tellurics.config.parameters import PHYSICAL_COLUMNS
-
-    columns = ["flat_index", "series_index", "frame_index", *PHYSICAL_COLUMNS]
+    columns = list(LABEL_COLUMNS)
     rows = [(sid, k) for sid, n in frames.items() for k in range(n)]
     rows = [rows[i] for i in np.random.default_rng(0).permutation(len(rows))]
     labels = np.zeros((len(rows), len(columns)), np.float32)
@@ -485,15 +463,14 @@ def _write_flat_file(path, frames=FLAT_FRAMES, nan_row: int | None = None) -> No
         f.create_dataset("labels", data=labels).attrs["columns"] = np.array(columns, dtype="S")
 
 
-def _flat_datamodule(path, tmp_path, single_frame=True):
+def _flat_datamodule(path, tmp_path):
     from tellurics.data.datamodule import TelluricDataModule
-    from tests._bounds import BOUNDS
 
     config = DataConfig(
         night_h5=path, metadata_columns=["airmass", "pwv"],
         metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)},
     )
-    module = TelluricDataModule(config, run_dir=tmp_path, single_frame=single_frame)
+    module = TelluricDataModule(config, run_dir=tmp_path)
     module._load_metadata()
     return module
 
@@ -542,12 +519,6 @@ class TestFlatLayout:
             metadata_columns=("airmass", "pwv"),
         )
         assert len(ds) == 5 and {ds[i]["night_id"] for i in range(5)} == {1}
-
-    def test_whole_night_model_refuses_a_flat_file(self, tmp_path) -> None:
-        path = tmp_path / "flat.h5"
-        _write_flat_file(path)
-        with pytest.raises(ValueError, match="flat"):
-            _flat_datamodule(path, tmp_path, single_frame=False)
 
     def test_flat_file_needs_series_index(self, tmp_path) -> None:
         import h5py
@@ -617,45 +588,13 @@ class TestNoParameters:
         "fname", ["experiment_cnn_ae.yaml", "experiment_transformer_ae.yaml",
                   "experiment_specpt.yaml"],
     )
-    def test_single_frame_manifests_read_no_parameters_and_no_time(self, fname) -> None:
+    def test_manifests_read_only_metadata(self, fname) -> None:
         data = load_config(REPO / "experiments" / "single_frame" / fname).data
-        assert data.param_bounds is None
-        assert data.resolved_target_columns == () and data.resolved_time_column is None
-        assert set(data.bounds) == {"airmass", "PWV"}
-
-    def test_single_frame_models_reject_param_bounds(self) -> None:
-        from tests._bounds import BOUNDS
-        raw = load_config(
-            REPO / "experiments" / "single_frame" / "experiment_cnn_ae.yaml"
-        ).model_dump(mode="json")
-        raw["data"]["metadata_bounds"] = None
-        raw["data"]["param_bounds"] = {**{k: list(v) for k, v in BOUNDS.items()}, "pwv": [0, 25]}
-        raw["data"]["metadata_columns"] = ["airmass", "pwv"]
-        with pytest.raises(ValidationError, match="metadata_bounds"):
-            ExperimentConfig(**raw)
-
-    def test_whole_night_manifest_keeps_parameters_and_time(self) -> None:
-        data = load_config(REPO / "experiments" / "multiple_frames" / "experiment.yaml").data
-        assert data.param_bounds is not None and len(data.resolved_target_columns) == 16
-        assert data.resolved_time_column == "time_hours"
-
-    def test_whole_night_model_requires_a_time_column(self) -> None:
-        raw = load_config(
-            REPO / "experiments" / "multiple_frames" / "experiment.yaml"
-        ).model_dump(mode="json")
-        raw["data"]["time_column"] = None
-        with pytest.raises(ValidationError, match="time_column"):
-            ExperimentConfig(**raw)
-        raw["data"]["time_column"] = "time_hours"                 # metadata-only bounds
-        raw["data"]["param_bounds"] = None
-        raw["data"]["metadata_bounds"] = {"pressure": [600, 850], "temperature": [233, 318],
-                                          "humidity": [0, 100]}
-        with pytest.raises(ValidationError, match="time"):
-            ExperimentConfig(**raw)
+        assert data.metadata_columns == ["airmass", "PWV"]
+        assert set(data.metadata_bounds) == {"airmass", "PWV"}
 
     def test_minimal_file_loads_scales_and_trains(self, tmp_path) -> None:
         from tellurics.data.datamodule import build_scaler
-        from tests._bounds import BOUNDS
 
         path = tmp_path / "minimal.h5"
         _write_minimal_flat_file(path)
@@ -664,10 +603,10 @@ class TestNoParameters:
             metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)},
         )
         from tellurics.data.datamodule import TelluricDataModule
-        dm = TelluricDataModule(config, run_dir=tmp_path, single_frame=True)
+        dm = TelluricDataModule(config, run_dir=tmp_path)
         dm._load_metadata()
         scaler = build_scaler(config)
-        assert scaler.params is None and scaler.time is None and scaler.metadata is not None
+        assert scaler.columns == ("airmass", "pwv")
         ds = TelluricFrameDataset(
             night_ids=[0, 1, 2], h5_path=path, pool=_DistinctStars(),
             star_assignment=np.array([0, 1, 2]), night_rows=dm.night_rows, scaler=scaler,
@@ -717,8 +656,7 @@ class TestObservedInput:
     def test_manifests_default_to_tellurics_with_noise_on_simulations(self) -> None:
         for f in ("single_frame/experiment_cnn_ae.yaml",
                   "single_frame/experiment_transformer_ae.yaml",
-                  "single_frame/experiment_specpt.yaml",
-                  "multiple_frames/experiment.yaml"):
+                  "single_frame/experiment_specpt.yaml"):
             data = load_config(REPO / "experiments" / f).data
             assert data.observed_key is None                 # tellurics x star
             assert data.simulated and data.noise_level_mean == 0.01 and data.noise_level_std == 0.001
@@ -731,7 +669,7 @@ class TestObservedInput:
 
         path = tmp_path / "obs.h5"
         _write_observed_flat_file(path)
-        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path)
         dm.setup()
         assert dm.stellar_pool is None and dm.stellar_assignment is None
         assert not (tmp_path / "stellar_assignment.csv").exists()
@@ -752,7 +690,7 @@ class TestObservedInput:
         path = tmp_path / "obs.h5"
         _write_observed_flat_file(path)
         dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path,
-                                batch_size=4, num_workers=0, single_frame=True)
+                                batch_size=4, num_workers=0)
         dm.setup()
         loader = DataLoader(dm.train_ds, batch_size=4)
         module = TelluricTrainingModule(
@@ -773,7 +711,7 @@ class TestObservedInput:
         path = tmp_path / "obs.h5"
         _write_observed_flat_file(path, key="flux_obs")
         dm = TelluricDataModule(_observed_config(path, observed_key="flux_obs"),
-                                run_dir=tmp_path, single_frame=True)
+                                run_dir=tmp_path)
         dm.setup()
         assert len(dm.train_ds) > 0
 
@@ -782,7 +720,7 @@ class TestObservedInput:
 
         path = tmp_path / "obs.h5"
         _write_minimal_flat_file(path)                      # no 'observed'
-        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path)
         with pytest.raises(KeyError, match="observed"):
             dm.setup()
 
@@ -791,19 +729,9 @@ class TestObservedInput:
 
         path = tmp_path / "obs.h5"
         _write_observed_flat_file(path, bad_shape=True)
-        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path, single_frame=True)
+        dm = TelluricDataModule(_observed_config(path), run_dir=tmp_path)
         with pytest.raises(ValueError, match="shape"):
             dm.setup()
-
-    def test_whole_night_observed_input_needs_use_stellar_false(self) -> None:
-        raw = load_config(
-            REPO / "experiments" / "multiple_frames" / "experiment.yaml"
-        ).model_dump(mode="json")
-        raw["data"]["observed_key"] = "observed"
-        with pytest.raises(ValidationError, match="use_stellar"):
-            ExperimentConfig(**raw)
-        raw["model"]["use_stellar"] = False
-        assert ExperimentConfig(**raw).model.use_stellar is False
 
     def test_tellurics_input_still_needs_stars(self, tmp_path) -> None:
         path = tmp_path / "flat.h5"

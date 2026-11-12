@@ -22,9 +22,9 @@ class ExperimentConfig(BaseModel):
 
     Artefacts are written under ``run_dir``::
 
-        runs/temporal_conv_001/
+        runs/cnn_ae/
         |-- config.yaml               # resolved copy of this manifest
-        |-- stellar_assignment.csv    # night -> star audit (from the DataModule)
+        |-- stellar_assignment.csv    # night -> star audit (observed_key: null only)
         |-- logs/                     # logger output
         +-- checkpoints/              # ModelCheckpoint output
     """
@@ -37,7 +37,7 @@ class ExperimentConfig(BaseModel):
     )
     wandb: WandbConfig = Field(default_factory=WandbConfig)
     model: AnyModelConfig
-    data: DataConfig = Field(default_factory=DataConfig)
+    data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
 
 
@@ -53,50 +53,8 @@ class ExperimentConfig(BaseModel):
             )
         return self
 
-    @model_validator(mode="after")
-    def _whole_night_model_needs_time(self) -> "ExperimentConfig":
-        """The whole-night model's TimeEncoder needs a time column."""
-        if not self.model.single_frame and self.data.resolved_time_column is None:
-            raise ValueError(
-                f"model {self.model.architecture.value} uses exposure times: "
-                "give data.param_bounds and data.time_column (e.g. time_hours)"
-            )
-        return self
 
-    @model_validator(mode="after")
-    def _single_frame_models_use_metadata_bounds(self) -> "ExperimentConfig":
-        """Single-frame models read only metadata: no time, no parameters."""
-        if self.model.single_frame and self.data.param_bounds is not None:
-            raise ValueError(
-                f"model {self.model.architecture.value} reads only metadata: "
-                "replace data.param_bounds with data.metadata_bounds (bounds "
-                "for data.metadata_columns only)"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _stellar_input_matches_the_data(self) -> "ExperimentConfig":
-        """The whole-night model's stellar input needs stars in the data.
-
-        With ``model.use_stellar`` it takes the stellar spectrum as an input,
-        which only pure-telluric data (``data.observed_key: null``) provides;
-        observed-flux data and real observations need ``use_stellar: false``.
-        """
-        if self.model.single_frame or not self.model.use_stellar:
-            return self
-        if self.data.observed_key is not None:
-            raise ValueError(
-                "data.observed_key is set (observed flux, no stellar spectrum) "
-                "but model.use_stellar is true: set model.use_stellar: false"
-            )
-        if self.data.real:
-            raise ValueError(
-                "data.real observations have no stellar spectrum: set "
-                "model.use_stellar: false to predict them with the whole-night model"
-            )
-        return self
-
-def load_config(path: str | Path | None) -> ExperimentConfig:
+def load_config(path: str | Path) -> ExperimentConfig:
     """
     Load and validate an experiment configuration from a YAML file.
 
@@ -104,7 +62,7 @@ def load_config(path: str | Path | None) -> ExperimentConfig:
         validation. Omitted sections use their default configuration values.
 
         Args:
-            path: YAML manifest path, or ``None`` to use all defaults.
+            path: YAML manifest path.
 
         Returns:
             A validated ``ExperimentConfig`` instance.
@@ -114,9 +72,6 @@ def load_config(path: str | Path | None) -> ExperimentConfig:
             ValueError: If the YAML content is not a mapping.
             RuntimeError: If a referenced environment variable is unset.
     """
-    if path is None:
-        return ExperimentConfig()
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"experiment manifest not found: {path}")

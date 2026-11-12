@@ -1,8 +1,6 @@
-"""Metadata encoder, shared by the multiple-frame and single-frame models.
+"""Metadata encoder, shared by the CNN and transformer autoencoders.
 
-The whole-night model applies it per exposure ``(B, T, M) -> (B, T, C)`` and
-concatenates the code with the spectral codes; the single-frame CNN and
-transformer autoencoders apply it to their exposure ``(B, M) -> (B, C)``.
+Maps each observation's metadata ``(B, M) -> (B, C)``, with
 ``M = len(data.metadata_columns)`` (e.g. airmass, PWV).
 """
 
@@ -15,15 +13,12 @@ __all__ = ["MetadataEncoder"]
 class MetadataEncoder(nn.Module):
     """Encode per-exposure metadata scalars into a conditioning code.
 
-    Maps the ``P`` scalar conditions of every exposure (e.g. airmass,
-    pwv, humidity, ...) to a ``C``-dim code with a small MLP **shared**
-    over the ``T`` exposures (the same instance is applied to each one):
+    Maps the ``M`` scalar conditions of an observation (e.g. airmass, PWV)
+    to a ``C``-dim code with a small MLP:
 
-        metadata (B, T, P)  ->  M_code (B, T, C)
+        metadata (B, M)  ->  code (B, C)
 
-    The code is meant to be concatenated with the per-exposure spectral code
-    ``Z (B, T, d)``, yielding ``(B, T, d + C)`` tokens for the temporal
-    Perceiver, so the attention can condition on per-exposure metadata.
+    The code is joined to the spectral input of the autoencoders.
 
     Forward accepts any leading dimensions: ``(..., P) -> (..., C)``.
     """

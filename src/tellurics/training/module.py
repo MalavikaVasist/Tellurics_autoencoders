@@ -1,21 +1,16 @@
-"""PyTorch Lightning module for training the whole-night telluric predictor.
+"""PyTorch Lightning module: trains one per-observation telluric model.
 
-The model predicts the full telluric transmission spectrum of every exposure
-in the sample -- a whole night (T exposures) or a single exposure (T = 1, for
-the single-frame models). Training uses MSE between the predicted and true
-transmission.
-
-Inputs:
-    observed: (B, T, N) observed spectra.
-    stellar: (B, N) stellar spectrum used to create the observations.
-    metadata: (B, T, 3) pressure, temperature, and humidity.
-    time: (B, T) exposure times.
+Inputs (one batch of observations):
+    observed:   (B, N) observed spectra (the model input).
+    metadata:   (B, M) e.g. airmass, PWV, scaled to [0, 1].
+    wavelength: (B, N) wavelength grid (used by the transformer autoencoder).
 
 The model predicts:
-    telluric: (B, T, N) telluric transmission time series.
+    telluric: (B, N) one telluric spectrum per observation.
 
-Target: ``batch["telluric"]`` (B, T, N), the noiseless transmission used to
-build ``observed``. Transmission is physical (in [0, 1]) and never rescaled.
+Loss: MSE between the prediction and ``batch["telluric"]`` (B, N), the
+noiseless telluric spectrum. Transmission is physical (in [0, 1]) and never
+rescaled.
 """
 
 from __future__ import annotations
@@ -35,9 +30,9 @@ logger = get_logger(__name__)
 
 
 class TelluricTrainingModule(pl.LightningModule):
-    """Train the whole-night telluric time-series predictor.
+    """Train a per-observation telluric model.
 
-    Uses MSE between predicted and true telluric transmission spectra.
+    Uses MSE between predicted and true telluric spectra.
     Also configures the optimizer and learning-rate scheduler.
     """
 
@@ -70,37 +65,28 @@ class TelluricTrainingModule(pl.LightningModule):
     def forward(
         self,
         observed: torch.Tensor,
-        stellar: torch.Tensor,
         metadata: torch.Tensor,
-        time: torch.Tensor,
         wavelength: torch.Tensor | None = None,
     ) -> ModelOutput:
-        """Run the telluric predictor.
+        """Run the telluric model.
 
         Args:
-            observed: Observed spectra with shape (B, T, N).
-            stellar: Stellar spectrum with shape (B, N) or (N,).
-            metadata: The ``data.metadata_columns`` with shape (B, T, M).
-            time: Exposure times with shape (B, T).
+            observed: Observed spectra with shape (B, N).
+            metadata: The ``data.metadata_columns`` with shape (B, M).
             wavelength: Wavelength grid (B, N) (used by the transformer
                 autoencoder as positional encoding; ignored by the others).
 
         Returns:
-            ModelOutput containing the predicted telluric time series (B, T, N).
+            ModelOutput containing the predicted telluric spectra (B, N).
         """
-        return self.model(
-            observed, stellar=stellar, metadata=metadata, time=time,
-            wavelength=wavelength,
-        )
+        return self.model(observed, metadata=metadata, wavelength=wavelength)
 
     # ------------------------------------------------------------------ #
     def _run_estimator(self, batch: dict[str, torch.Tensor]) -> ModelOutput:
         """Run the estimator using a DataModule batch."""
         return self(
             batch["observed"],
-            stellar=batch.get("stellar"),             # absent for data.input: observed
             metadata=batch["theta"]["metadata"],
-            time=batch["theta"].get("time"),          # absent for single-frame data
             wavelength=batch.get("wavelength"),
         )
 
@@ -111,8 +97,8 @@ class TelluricTrainingModule(pl.LightningModule):
 
         The loss is MSE between predicted and true telluric transmission.
         """
-        pred = self._run_estimator(batch).telluric               # (B, T, N)
-        target = batch["telluric"]                               # (B, T, N)
+        pred = self._run_estimator(batch).telluric               # (B, N)
+        target = batch["telluric"]                               # (B, N)
         loss = F.mse_loss(pred, target)
         rmse = loss.sqrt()
         is_train = stage == "train"
@@ -177,8 +163,8 @@ class TelluricTrainingModule(pl.LightningModule):
     ) -> ModelOutput:
         """Run the model on a batch without calculating loss.
 
-        Returns the predicted telluric time series ``(B, T, N)``, already
-        in physical transmission units.
+        Returns the predicted telluric spectra ``(B, N)``, already in
+        physical transmission units.
         """
         return self._run_estimator(batch)
 

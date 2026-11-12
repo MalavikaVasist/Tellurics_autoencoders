@@ -1,38 +1,29 @@
 """
-Lightning DataModule for whole-night telluric training.
+Lightning DataModule for single-observation telluric training.
 
-Combines the shared wavelength grid, PHOENIX stellar spectra, night-level
-train/validation/test splits, and the dataset. A sample is either one
-complete night ``(T, N)`` (whole-night models) or, with ``single_frame=True``,
-one observation ``(N,)`` (per-observation models; the exposures of all
-nights pooled). The split is night-level in
-both cases.
+Combines the shared wavelength grid, the night-level train/validation/test
+splits, the optional PHOENIX stellar spectra, and the dataset. A sample is one
+observation ``(N,)``; the exposures of all nights of a split are pooled, but
+no exposure of a validation or test night is ever seen in training.
 
-Each night is paired with one fixed, seeded stellar spectrum:
-    observed = flux * stellar_flux
+Input: with ``data.observed_key: null`` each night is paired with one fixed,
+seeded stellar spectrum, ``observed = flux * star``; with ``observed_key``
+set the observed flux is read from the file as stored (no stars).
 (``flux``: the telluric spectra, HDF5 dataset ``data.target_key``.)
 """
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import numpy as np
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from tellurics.config.data import DataConfig
-from tellurics.data.datasets.frames import TelluricFrameDataset
-from tellurics.data.datasets.timeseries import (
-    read_label_columns,
-    METADATA_COLUMNS,
-    TARGET_COLUMNS,
-    TIME_COLUMN,
-    TelluricTimeseriesDataset,
-)
-from tellurics.data.scaling import ParameterScaler
-from tellurics.data.splits import split_night_indices, split_night_indices_order
+from tellurics.data.datasets.frames import TelluricFrameDataset, read_label_columns
+from tellurics.data.scaling import MinMax
+from tellurics.data.splits import split_night_indices
 from tellurics.data.stellar import (
     StellarPool,
     assign_stellar_per_night,
@@ -44,35 +35,20 @@ from tellurics.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
-    """Build the ``[0, 1]`` label scaler described by a ``data:`` section.
+def build_scaler(config: DataConfig, *, clip: bool = False) -> MinMax | None:
+    """The ``[0, 1]`` metadata scaler described by a ``data:`` section.
 
-    A pure function of the declared bounds (``data.param_bounds`` or
-    ``data.metadata_bounds``) and the ``data.scale_*``
-    flags: no statistic is read off the data and no split is involved, so the
-    scaler is identical for train/val/test and can be rebuilt from a run's
-    ``config.yaml`` alone, e.g. to map ``theta["output_params"]`` back to
-    physical units::
+    A pure function of ``data.metadata_bounds`` (no statistic is read off the
+    data), so it is identical for every split and can be rebuilt from a run's
+    ``config.yaml`` alone. ``None`` with ``data.scale_metadata: false``.
 
-        scaler = build_scaler(load_config("runs/<run>/config.yaml").data)
-        physical = scaler.inverse_params(batch["theta"]["output_params"])
-
-    With ``clip`` the forward transform clamps physical values to the declared
-    bounds instead of raising. The data module enables it for the test split
-    only, where ``float32`` storage can put a value marginally outside the
-    declared envelope.
+    With ``clip`` the transform clamps values to the bounds instead of
+    raising: used for the test split (``float32`` storage can put a value
+    marginally outside) and for real observations.
     """
-    return ParameterScaler.from_bounds(
-        config.bounds,
-        metadata_columns=tuple(config.metadata_columns),
-        target_columns=config.resolved_target_columns,
-        time_column=config.resolved_time_column,
-        scale_metadata=config.scale_metadata,
-        scale_params=config.scale_params,
-        scale_time=config.scale_time,
-        clip=clip,
-    )
-
+    if not config.scale_metadata:
+        return None
+    return MinMax.from_bounds(config.metadata_columns, config.metadata_bounds, clip=clip)
 
 
 def read_layout(path: Path, shape_key: str) -> dict:
@@ -81,7 +57,8 @@ def read_layout(path: Path, shape_key: str) -> dict:
     Returns ``flat`` (one row per observation), ``n_nights``, and either
     ``rows`` / ``series`` (flat: rows per night, grouped by ``series_index``;
     nights may have different numbers of frames) or ``n_frames`` (night-major
-    ``(n_nights, T, N)``), plus the wavelength grid ``wavelength`` / ``unit``.
+    ``(n_nights, T, N)``), plus the wavelength grid ``wavelength`` / ``unit``
+    and the number of spectral samples ``n_samples``.
     """
     import h5py
 
@@ -110,42 +87,35 @@ def read_layout(path: Path, shape_key: str) -> dict:
 
 
 class TelluricDataModule(pl.LightningDataModule):
-    """Whole-night DataModule for training the :class:`NeuralTelluricPredictor`.
+    """Serves single observations ``(N,)`` with a night-level split.
 
     Args:
-        config: Input paths and night-level split settings (the manifest's
-            ``data:`` section).
+        config: The manifest's ``data:`` section.
         run_dir: This run's artefact directory; the night -> star audit CSV is
-            written to ``<run_dir>/stellar_assignment.csv``.
-        batch_size: Samples per batch -- whole nights, or single exposures
-            with ``single_frame`` (the manifest's ``training:`` section).
-        num_workers: DataLoader workers (the manifest's ``training:`` section).
-        single_frame: Serve single observations ``(N,)`` instead of whole
-            nights (set from the model config's ``single_frame``).
+            written to ``<run_dir>/stellar_assignment.csv`` (stars only).
+        batch_size: Observations per batch.
+        num_workers: DataLoader workers.
     """
 
     def __init__(
         self,
         config: DataConfig,
         run_dir: str | Path,
-        batch_size: int = 4,
+        batch_size: int = 64,
         num_workers: int = 2,
-        single_frame: bool = False,
     ) -> None:
-        """Initialize."""
         super().__init__()
         self.save_hyperparameters()
         self.config = config
         self.run_dir = Path(run_dir)
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.single_frame = single_frame
 
     # -- attributes set by setup() ------------------------------------------ #
     wavegrid: Wavegrid | None = None
     stellar_pool: StellarPool | None = None
     stellar_assignment: np.ndarray | None = None      # (n_nights,) star indices
-    scaler: ParameterScaler | None = None             # [0,1] label scaling
+    scaler: MinMax | None = None                      # [0,1] metadata scaling
     n_nights: int = 0
     n_frames: int = 0                                 # night-major layout only
     night_rows: dict[int, np.ndarray] | None = None   # flat layout: night -> rows
@@ -153,30 +123,29 @@ class TelluricDataModule(pl.LightningDataModule):
     train_ids: list[int] = []
     val_ids: list[int] = []
     test_ids: list[int] = []
-    train_ds: TelluricTimeseriesDataset | None = None
-    val_ds: TelluricTimeseriesDataset | None = None
-    test_ds: TelluricTimeseriesDataset | None = None
-    real_ds: dict[str, TelluricTimeseriesDataset] = {}   # data.real, prediction only
+    train_ds: TelluricFrameDataset | None = None
+    val_ds: TelluricFrameDataset | None = None
+    test_ds: TelluricFrameDataset | None = None
+    real_ds: dict[str, TelluricFrameDataset] = {}     # data.real, prediction only
 
     # -- setup -------------------------------------------------------------- #
     def setup(self, stage: str | None = None) -> None:
-        """Prepare metadata, splits, star assignment and datasets (once)."""
+        """Prepare layout, splits, (stars) and datasets (once)."""
         if self.train_ds is not None:
             return
 
-        self._load_metadata()  # shapes + wavelength grid
-        self._make_scaler()    # [0,1] scaling from the declared bounds
+        self._load_metadata()  # layout + wavelength grid
+        self.scaler = build_scaler(self.config)
         self._make_splits()    # night-level train/val/test
         if self.observed_input:
-            # The file already holds the observed flux: no stellar spectra.
             logger.info(
                 f"data.observed_key = '{self.config.observed_key}': reading the "
-                "observed flux from the file; no stellar spectra assigned"
+                "observed flux from the file; no stellar spectra"
             )
         else:
             self._assign_stars()   # fixed stellar spectrum per night + audit CSV
-        self._make_datasets()  # one dataset per split
-        self._make_real_datasets()  # data.real: prediction-only observations
+        self._make_datasets()      # one dataset per split
+        self._make_real_datasets() # data.real: prediction-only observations
 
     @property
     def observed_input(self) -> bool:
@@ -184,19 +153,13 @@ class TelluricDataModule(pl.LightningDataModule):
         return self.config.observed_key is not None
 
     def _load_metadata(self) -> None:
-        """Read the shapes and the wavelength grid."""
-        if self.single_frame and self.config.param_bounds is not None:
-            raise ValueError(
-                "single-frame models read only metadata: give data.metadata_bounds "
-                "instead of data.param_bounds"
-            )
+        """Read the layout and the wavelength grid."""
         night_h5 = Path(self.config.night_h5)
         if not night_h5.exists():
             raise FileNotFoundError(
-                f"night-major HDF5 not found at {night_h5}. It is resolved "
-                "relative to $TELLURICS_DATA -- check that the variable points "
-                "at the data directory and that the file exists. Create it "
-                "once with tests/testing_dataset_reshape.ipynb."
+                f"HDF5 not found at {night_h5}. It is resolved relative to "
+                "$TELLURICS_DATA -- check that the variable points at the data "
+                "directory and that the file exists."
             )
 
         import h5py
@@ -221,34 +184,23 @@ class TelluricDataModule(pl.LightningDataModule):
                         f"'{target}' {f[target].shape} (the target)"
                     )
         layout = read_layout(night_h5, target)
-        flat = layout["flat"]
-        available_nights = layout["n_nights"]
-        if flat:
-            rows = layout["rows"]
-            self.night_series = layout["series"]   # night position -> series_index
-        else:
-            self.n_frames = layout["n_frames"]
-        wl, unit = layout["wavelength"], layout["unit"]
 
         # Debug/smoke runs may cap the nights used (the first N); the split and
         # the star assignment then only cover those nights.
-        self.n_nights = available_nights
+        available = layout["n_nights"]
+        self.n_nights = available
         cap = self.config.max_nights
-        if cap is not None and cap < available_nights:
+        if cap is not None and cap < available:
             self.n_nights = cap
             logger.warning(
                 f"data.max_nights={cap}: using only the first {cap} of "
-                f"{available_nights} nights (smoke/debug subset)."
+                f"{available} nights (smoke/debug subset)."
             )
 
-        self.wavegrid = Wavegrid(wavelength=wl, unit=unit)
-        if flat:
-            if not self.single_frame:
-                raise ValueError(
-                    f"{night_h5} is flat (one row per observation): only the "
-                    "single-frame models can use it; the whole-night model "
-                    "needs the night-major (n_nights, T, N) layout"
-                )
+        self.wavegrid = Wavegrid(wavelength=layout["wavelength"], unit=layout["unit"])
+        if layout["flat"]:
+            rows = layout["rows"]
+            self.night_series = layout["series"]   # night position -> series_index
             self.night_rows = {i: rows[i] for i in range(self.n_nights)}
             counts = np.array([len(rows[i]) for i in range(self.n_nights)])
             logger.info(
@@ -257,22 +209,9 @@ class TelluricDataModule(pl.LightningDataModule):
                 f"flat {night_h5}"
             )
         else:
+            self.n_frames = layout["n_frames"]
             logger.info(
                 f"{self.n_nights} nights x {self.n_frames} frames from {night_h5}"
-            )
-
-
-    def _make_scaler(self) -> None:
-        """Build the ``[0, 1]`` scaler from the manifest's declared bounds.
-        """
-        self.scaler = build_scaler(self.config)
-        if not any(
-            (self.scaler.scale_metadata, self.scaler.scale_params,
-             self.scaler.scale_time)
-        ):
-            logger.info(
-                "data.scale_metadata/scale_params/scale_time are all false: "
-                "labels are fed to the model in physical units."
             )
 
     def _make_splits(self) -> None:
@@ -305,50 +244,39 @@ class TelluricDataModule(pl.LightningDataModule):
         )
         logger.info(
             f"train {len(self.train_ids)} / val {len(self.val_ids)} / "
-            f"test {len(self.test_ids)}; stellar audit -> {audit_csv}"
+            f"test {len(self.test_ids)} nights; stellar audit -> {audit_csv}"
         )
 
-  
+    def _layout_kwargs(self) -> dict:
+        """``night_rows`` (flat) or ``n_frames`` (night-major) for the datasets."""
+        if self.night_rows is not None:
+            return {"night_rows": self.night_rows}
+        return {"n_frames": self.n_frames}
+
     def _make_datasets(self) -> None:
-        """Wrap each split in a :class:`TelluricTimeseriesDataset`.
+        """One :class:`TelluricFrameDataset` per split.
 
         The test split gets a clipping scaler: labels are stored as
         ``float32``, so a frame on a declared bound can scale marginally
         outside ``[0, 1]`` and would otherwise raise. Train and validation
         stay strict so a mis-declared bound still fails loudly.
         """
+        cfg = self.config
         common = dict(
-            h5_path=self.config.night_h5,
-            pool=self.stellar_pool,                 # None for data.input: observed
+            h5_path=cfg.night_h5,
+            pool=self.stellar_pool,                     # None with observed_key
             star_assignment=self.stellar_assignment,
-            observed_key=self.config.observed_key if self.observed_input else None,
-            metadata_columns=tuple(self.config.metadata_columns),
-            target_key=self.config.target_key,
+            observed_key=cfg.observed_key,
+            target_key=cfg.target_key,
+            metadata_columns=tuple(cfg.metadata_columns),
+            **self._layout_kwargs(),
         )
-        logger.info(f"metadata columns: {list(self.config.metadata_columns)}")
-        dataset_cls = TelluricTimeseriesDataset
-        if not self.single_frame:
-            # whole night: also exposure times (and parameters, analysis only)
-            common["target_columns"] = self.config.resolved_target_columns
-            common["time_column"] = self.config.resolved_time_column
-        else:
-            # single frames read metadata only: no time, no parameters
-            dataset_cls = TelluricFrameDataset
-            if self.night_rows is not None:
-                common["night_rows"] = self.night_rows      # flat: any frames per night
-            else:
-                common["n_frames"] = self.n_frames
-                logger.info(
-                    f"single-frame samples: {self.n_frames} exposures per night"
-                )
-        test_scaler = (
-            None if self.scaler is None else build_scaler(self.config, clip=True)
-        )
+        logger.info(f"metadata columns: {list(cfg.metadata_columns)}")
+
         # Gaussian noise on simulated inputs only: fresh every read for
         # training, fixed (seeded) for validation / test so their losses are
         # comparable from epoch to epoch. Each observation draws its own
         # relative level ~ N(noise_level_mean, noise_level_std^2).
-        cfg = self.config
         noisy = cfg.simulated and cfg.noise_level_mean > 0
         noise = dict(
             noise_level_mean=cfg.noise_level_mean if noisy else 0.0,
@@ -364,16 +292,16 @@ class TelluricDataModule(pl.LightningDataModule):
                 f"train/val repeated x{repeats} per epoch with new noise"
             )
         seed = cfg.seed
-        self.train_ds = dataset_cls(
+        self.train_ds = TelluricFrameDataset(
             night_ids=self.train_ids, scaler=self.scaler,
             noise_seed=None, repeats=repeats, **noise, **common
         )
-        self.val_ds = dataset_cls(
+        self.val_ds = TelluricFrameDataset(
             night_ids=self.val_ids, scaler=self.scaler,
             noise_seed=seed + 1, repeats=repeats, **noise, **common
         )
-        self.test_ds = dataset_cls(
-            night_ids=self.test_ids, scaler=test_scaler,
+        self.test_ds = TelluricFrameDataset(
+            night_ids=self.test_ids, scaler=build_scaler(cfg, clip=True),
             noise_seed=seed + 2, repeats=1, **noise, **common
         )
         logger.info(
@@ -385,16 +313,11 @@ class TelluricDataModule(pl.LightningDataModule):
         """One prediction-only dataset per ``data.real`` file.
 
         Real observations: observed flux as stored, no target, no noise, no
-        stellar spectra. Every observation of the file is used. Labels are
-        scaled with the training bounds, clipped (real values may sit outside).
+        stellar spectra. Every observation of the file is used. The metadata
+        is scaled with the training bounds (as the model was trained), and
+        clipped since real values may sit outside them.
         """
         self.real_ds = {}
-        if not self.config.real:
-            return
-        scaler = None
-        if self.scaler is not None:
-            # real files carry no telluric parameters: drop that scaler group
-            scaler = dataclasses.replace(build_scaler(self.config, clip=True), params=None)
         for source in self.config.real:
             layout = read_layout(source.night_h5, source.observed_key)
             if layout["n_samples"] != self.wavegrid.wavelength.size:
@@ -403,33 +326,24 @@ class TelluricDataModule(pl.LightningDataModule):
                     f"wavelength samples; the training data has "
                     f"{self.wavegrid.wavelength.size}"
                 )
-            common = dict(
-                night_ids=list(range(layout["n_nights"])),
-                h5_path=source.night_h5, pool=None, star_assignment=None,
-                scaler=scaler, observed_key=source.observed_key, has_target=False,
-                metadata_columns=tuple(self.config.metadata_columns),
+            layout_kw = (
+                {"night_rows": dict(enumerate(layout["rows"]))} if layout["flat"]
+                else {"n_frames": layout["n_frames"]}
             )
-            if self.single_frame:
-                if layout["flat"]:
-                    common["night_rows"] = dict(enumerate(layout["rows"]))
-                else:
-                    common["n_frames"] = layout["n_frames"]
-                ds = TelluricFrameDataset(**common)
-            else:
-                if layout["flat"]:
-                    raise ValueError(
-                        f"data.real '{source.name}' is flat: the whole-night "
-                        "model needs the night-major (n_nights, T, N) layout"
-                    )
-                ds = TelluricTimeseriesDataset(
-                    **common, target_columns=(),
-                    time_column=self.config.resolved_time_column,
-                )
+            ds = TelluricFrameDataset(
+                night_ids=list(range(layout["n_nights"])),
+                h5_path=source.night_h5,
+                scaler=build_scaler(self.config, clip=True),
+                metadata_columns=tuple(self.config.metadata_columns),
+                observed_key=source.observed_key,
+                has_target=False,
+                **layout_kw,
+            )
             self.real_ds[source.name] = ds
             logger.info(f"real observations '{source.name}': {len(ds)} samples")
 
     # -- loaders ------------------------------------------------------------ #
-    def _loader(self, ds: TelluricTimeseriesDataset, shuffle: bool) -> DataLoader:
+    def _loader(self, ds: TelluricFrameDataset, shuffle: bool) -> DataLoader:
         return DataLoader(
             ds,
             batch_size=self.batch_size,

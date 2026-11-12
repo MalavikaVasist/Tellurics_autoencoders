@@ -1,4 +1,4 @@
-"""Telluric output activation, shared by the multiple-frame and single-frame models.
+"""Telluric output activation, shared by all models.
 
 Every model ends with an unconstrained per-wavelength output ``z`` that is
 mapped to a transmission by :func:`apply_telluric_activation`, according to

@@ -14,8 +14,8 @@ class ModelOutput:
     attributes without changing downstream code.
 
     Attributes:
-        telluric: Predicted telluric transmission time series, one full
-            spectrum per exposure. Shape: (B, T, N).
+        telluric: Predicted telluric transmission, one full spectrum per
+            observation. Shape: (B, N).
         latent: Latent embedding from the encoder. Shape: (B, D_latent).
         attention_weights: Attention maps if available. Shape varies by architecture.
         intermediate_features: Dictionary of intermediate feature representations.

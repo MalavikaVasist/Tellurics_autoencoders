@@ -12,21 +12,18 @@ different numbers of frames)::
 
 * ``reconstruct`` is the architecture (CNN / transformer / SpecPT) and returns
   an unconstrained per-wavelength output ``z``. The CNN and transformer
-  autoencoders join the metadata to the spectrum (as the whole-night model
-  does); the transformer also uses the wavelengths as positional encoding.
+  autoencoders join the metadata to the spectrum; the transformer also uses the wavelengths as positional encoding.
   SpecPT uses the spectrum only.
 * ``template`` is a learned per-wavelength offset: the mean telluric
   spectrum in the activation's raw space. Telluric lines sit at fixed
   wavelengths, so this costs only ``N`` parameters and lets the network spend
   its capacity on the exposure-to-exposure *variation*.
-* the activation is the same as the whole-night head
-  (:mod:`tellurics.models.activations`): ``optical_depth``
+* the activation (:mod:`tellurics.models.activations`): ``optical_depth``
   gives ``T = exp(-softplus(z))`` in ``(0, 1]``.
 
-The forward signature matches :class:`~tellurics.models.multiple_frames.predictor.NeuralTelluricPredictor`
-(``stellar`` / ``metadata`` / ``time`` / ``wavelength`` keywords) so the same
-training module drives every model. The stellar spectrum enters through
-``observed = T_tell * S`` (built by the dataset); ``time`` is unused.
+Every model is called as ``model(observed, metadata=..., wavelength=...)``
+by the same training module. The stellar spectrum (if any) is already inside
+``observed`` (built by the dataset).
 """
 
 from __future__ import annotations
@@ -107,9 +104,7 @@ class SingleFrameTelluricModel(nn.Module):
     def forward(
         self,
         observed: torch.Tensor,
-        stellar: torch.Tensor | None = None,     # unused: S is inside observed
         metadata: torch.Tensor | None = None,    # (B, M) CNN / transformer AE
-        time: torch.Tensor | None = None,        # unused
         wavelength: torch.Tensor | None = None,  # (B, N) transformer AE
     ) -> ModelOutput:
         """Predict one telluric spectrum per observation.

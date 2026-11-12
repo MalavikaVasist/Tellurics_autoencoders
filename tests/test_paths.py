@@ -23,7 +23,7 @@ from tests._bounds import BOUNDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENTS = REPO_ROOT / "experiments"
-# Every tracked manifest, relative to experiments/ (multiple_frames/, single_frame/).
+# Every tracked manifest, relative to experiments/ (single_frame/).
 TRACKED_MANIFESTS = sorted(
     str(p.relative_to(EXPERIMENTS)) for p in EXPERIMENTS.glob("*/*.yaml")
 )
@@ -80,7 +80,7 @@ def test_absolute_path_needs_no_env_var(monkeypatch) -> None:
 def test_data_config_resolves_relative_inputs(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv(DATA_ROOT_ENV, str(tmp_path))
     cfg = DataConfig(
-        param_bounds=BOUNDS,
+        metadata_bounds=BOUNDS,
         night_h5="telluric_timeseries/a.h5",
         phoenix_dir="phoenix/convolved",
     )
@@ -90,7 +90,7 @@ def test_data_config_resolves_relative_inputs(monkeypatch, tmp_path) -> None:
 
 def test_data_config_defaults_are_relative_on_disk(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv(DATA_ROOT_ENV, str(tmp_path))
-    cfg = DataConfig(param_bounds=BOUNDS)
+    cfg = DataConfig(metadata_bounds=BOUNDS)
     assert cfg.night_h5.is_absolute() and cfg.phoenix_dir.is_absolute()
     assert cfg.night_h5.is_relative_to(tmp_path.resolve())
     assert cfg.phoenix_dir.is_relative_to(tmp_path.resolve())
@@ -99,14 +99,14 @@ def test_data_config_defaults_are_relative_on_disk(monkeypatch, tmp_path) -> Non
 def test_data_config_requires_the_env_var(monkeypatch) -> None:
     monkeypatch.delenv(DATA_ROOT_ENV, raising=False)
     with pytest.raises(RuntimeError, match=DATA_ROOT_ENV):
-        DataConfig(param_bounds=BOUNDS)
+        DataConfig(metadata_bounds=BOUNDS)
 
 
 # --------------------------------------------------------------------------- #
 # End-to-end: one tracked manifest, two machines
 # --------------------------------------------------------------------------- #
 def test_tracked_manifest_resolves_per_machine(monkeypatch, tmp_path) -> None:
-    manifest = EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml"
+    manifest = EXPERIMENTS / "single_frame" / "experiment_cnn_ae.yaml"
 
     monkeypatch.setenv(DATA_ROOT_ENV, str(tmp_path / "machineA"))
     (tmp_path / "machineA").mkdir()
@@ -179,7 +179,7 @@ def test_load_config_expands_root_and_ignores_cwd(monkeypatch, tmp_path) -> None
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
 
-    cfg = load_config(EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml").data
+    cfg = load_config(EXPERIMENTS / "single_frame" / "experiment_cnn_ae.yaml").data
     assert cfg.root == root.resolve()
     assert cfg.night_h5 == root.resolve() / "telluric_timeseries/telluric_templates_nights.h5"
     assert cfg.phoenix_dir == root.resolve() / "phoenix/convolved"
@@ -190,10 +190,10 @@ def test_tracked_manifest_unset_var_raises(monkeypatch) -> None:
     """An unset ``${TELLURICS_DATA}`` must not silently resolve to a path."""
     monkeypatch.delenv(DATA_ROOT_ENV, raising=False)
     with pytest.raises(FileNotFoundError, match=DATA_ROOT_ENV):
-        load_config(EXPERIMENTS / "multiple_frames" / "experiment1_smoke.yaml")
+        load_config(EXPERIMENTS / "single_frame" / "experiment_cnn_ae.yaml")
 
 
 def test_data_config_rejects_nonexistent_root(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv(DATA_ROOT_ENV, raising=False)
-    with pytest.raises(FileNotFoundError, match="data.root"):
-        DataConfig(param_bounds=BOUNDS, root=tmp_path / "does-not-exist")
+    with pytest.raises(FileNotFoundError, match="Data root"):
+        DataConfig(metadata_bounds=BOUNDS, root=tmp_path / "does-not-exist")

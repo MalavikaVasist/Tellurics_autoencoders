@@ -2,8 +2,8 @@
 
 Input: the observed spectrum ``X = T_tell * S`` (the telluric transmission
 times the raw stellar spectrum, built by the dataset) and the exposure's
-metadata (``data.metadata_columns``, e.g. airmass + PWV). As in the
-whole-night model, the metadata goes through the shared
+metadata (``data.metadata_columns``, e.g. airmass + PWV). The metadata goes
+through the shared
 :class:`~tellurics.models.metadata.MetadataEncoder` and its code is
 concatenated with the spectral features -- here, with the flattened conv
 features right before the bottleneck, so ``[spectrum ; metadata]`` is what is
@@ -80,7 +80,7 @@ class CNNAutoencoder(SingleFrameTelluricModel):
         self.enc_len = length                                   # e.g. 1612
         bc = config.bottleneck_channels
 
-        # ---- metadata (shared encoder, as in the whole-night model) ------- #
+        # ---- metadata (shared encoder) ------------------------------------ #
         self.metadata_encoder = MetadataEncoder(
             config.metadata_dim, config.metadata_enc_dim,
             config.metadata_enc_hidden, dropout=config.dropout,

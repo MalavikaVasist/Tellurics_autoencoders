@@ -1,57 +1,44 @@
-
 """
-Train one telluric estimator: the whole-night model or a single-frame model.
+Train one per-observation telluric model.
 
-Four experiments share this script; each has its own manifest and the
-``model.architecture`` value selects both the model and the sample type:
+Three experiments share this script; each has its own manifest, and
+``model.architecture`` selects the model:
 
-    experiments/multiple_frames/experiment.yaml               neural_telluric_predictor  (B, T, N)
-    experiments/single_frame/experiment_cnn_ae.yaml           cnn_autoencoder            (B, N) -> (B, N)
-    experiments/single_frame/experiment_transformer_ae.yaml   transformer_autoencoder    (B, N) -> (B, N)
-    experiments/single_frame/experiment_specpt.yaml           specpt                     (B, N) -> (B, N)
+    experiments/single_frame/experiment_cnn_ae.yaml           cnn_autoencoder
+    experiments/single_frame/experiment_transformer_ae.yaml   transformer_autoencoder
+    experiments/single_frame/experiment_specpt.yaml           specpt
 
-The manifest folders mirror ``tellurics.models``: ``multiple_frames/`` for the
-whole-night model, ``single_frame/`` for the single-exposure autoencoders.
+Every model takes one observation and returns one telluric spectrum,
+``observed (B, N) + metadata (B, M) -> telluric (B, N)``.
 
 Pipeline
 --------
-1. Load the night-major telluric HDF5 dataset (nights x 73 frames x 51,557
-   wavelength samples), prepared by tests/testing_dataset_reshape.ipynb.
+1. TelluricDataModule reads the HDF5 (flat: one row per observation, nights
+   with any number of frames; or night-major (nights, T, N)), splits it by
+   night, builds the input (stored observed flux, or flux x a fixed PHOENIX
+   star per night), adds the configured noise to simulated inputs, and serves
+   single observations.
 
-2. TelluricDataModule pairs each night with a fixed, seeded PHOENIX stellar
-   spectrum and serves either whole nights or, for single-frame models,
-   single exposures (night-level split either way):
-   - observed spectra: (B, T, N)  or single observations (B, N)
-   - stellar spectra: (B, N)
-   - telluric transmission (target): (B, T, N)  or (B, N)
-   - theta: time, atmospheric metadata (pressure, temperature, humidity)
-     as inputs, plus the 16 telluric parameters (not used in the loss).
+2. TelluricTrainingModule minimizes the mean squared error between the
+   predicted and true telluric spectra:
 
-3. TelluricTrainingModule trains and validates the estimator by minimizing
-   mean squared error (MSE) between predicted and true telluric spectra:
+       loss = MSE(model(observed, metadata, wavelength).telluric, batch["telluric"])
 
-       loss = MSE(estimator(...).telluric, batch["telluric"])
+3. After training, the best checkpoint predicts the tellurics of the real
+   observations in data.real (if any) into <run_dir>/predictions/.
 
-Configuration
--------------
-A YAML manifest defines the run directory, WandB settings, model
-architecture, data paths and splits, and training settings such as
-the optimizer, number of epochs, batch size, and logging.
-
-Each run saves its configuration, stellar assignments, logs, and
+Each run saves its configuration, stellar assignments (stars only), logs, and
 checkpoints in its output directory:
 
     runs/<experiment>/
     ├── config.yaml
     ├── stellar_assignment.csv
     ├── logs/
-    └── checkpoints/
+    ├── checkpoints/
+    └── predictions/
 
 Examples
 --------
-Train using an experiment configuration:
-
-    python -m tellurics.scripts.train --config experiments/multiple_frames/experiment.yaml
     python -m tellurics.scripts.train --config experiments/single_frame/experiment_cnn_ae.yaml
     python -m tellurics.scripts.train --config experiments/single_frame/experiment_transformer_ae.yaml
     python -m tellurics.scripts.train --config experiments/single_frame/experiment_specpt.yaml
@@ -60,6 +47,10 @@ Train on CPU or resume from a checkpoint (checkpoints/<architecture>/):
 
     python -m tellurics.scripts.train --config experiments/single_frame/experiment_specpt.yaml \\
         --device cpu --resume runs/specpt/checkpoints/specpt/x.ckpt
+
+Predict the data.real observations with a trained checkpoint:
+
+    python -m tellurics.scripts.train --config ... --predict runs/cnn_ae/checkpoints/cnn_autoencoder/x.ckpt
 """
 import argparse
 from pathlib import Path
@@ -93,7 +84,7 @@ logger = get_logger(__name__)
 def parse_args() -> argparse.Namespace:
     """Parse the deliberately tiny CLI: the manifest plus two run overrides."""
     parser = argparse.ArgumentParser(
-        description="Train the whole-night telluric time-series estimator."
+        description="Train a per-observation telluric model."
     )
     parser.add_argument(
         "--config", type=Path, required=True,
@@ -167,15 +158,13 @@ def build_datamodule(
     data: DataConfig,
     training: TrainingConfig,
     run_dir: Path,
-    single_frame: bool = False,
 ) -> TelluricDataModule:
     """Build the DataModule, failing early on missing inputs."""
     if not data.night_h5.exists():
         raise FileNotFoundError(
-            f"night-major HDF5 not found at {data.night_h5}. It is resolved "
-            "relative to $TELLURICS_DATA -- check that the variable points at "
-            "the data directory and that the file exists. Create it once with "
-            "tests/testing_dataset_reshape.ipynb."
+            f"HDF5 not found at {data.night_h5}. It is resolved relative to "
+            "$TELLURICS_DATA -- check that the variable points at the data "
+            "directory and that the file exists."
         )
     # Stellar spectra are only needed for pure-telluric data (observed_key: null).
     if data.observed_key is None and not data.phoenix_dir.is_dir():
@@ -194,7 +183,6 @@ def build_datamodule(
         run_dir=run_dir,
         batch_size=training.batch_size,
         num_workers=training.num_workers,
-        single_frame=single_frame,
     )
 
 
@@ -204,13 +192,9 @@ def build_model(
 ) -> TelluricTrainingModule:
     """Build the LightningModule (registry-resolved estimator) to train.
     """
-    frames = (
-        "single observations (B, N) -> (B, N)" if model_config.single_frame
-        else f"whole nights, T={model_config.n_frames_per_series}"
-    )
     logger.info(
         f"Training {model_config.architecture.value} | "
-        f"N={model_config.num_wavelength_bins}, {frames}, "
+        f"N={model_config.num_wavelength_bins}, observations (B, N) -> (B, N), "
         f"telluric_activation={model_config.telluric_activation.value}"
     )
     return TelluricTrainingModule(model_config, training_config)
@@ -221,7 +205,7 @@ def build_trainer(
     wandb_config: WandbConfig,
     run_dir: Path,
     device: str,
-    architecture: str = "neural_telluric_predictor",
+    architecture: str = "model",
 ) -> pl.Trainer:
     """Build the Trainer: callbacks, W&B logger and device placement."""
     checkpoint_dir = run_dir / config.checkpoint_dir
@@ -281,7 +265,7 @@ def train(
     run_dir: Path,
     device: str,
     resume: Path | None,
-    architecture: str = "neural_telluric_predictor",
+    architecture: str = "model",
 ) -> None:
     """Build the Trainer and run ``fit`` (optionally resuming a checkpoint)."""
     if resume is not None and not resume.exists():
@@ -359,13 +343,7 @@ def main() -> None:
     config = apply_overrides(config, args.overrides)
 
     run_dir = prepare_run_dir(config)
-    # The whole-night model trains on whole nights (B, T, N); the
-    # per-observation autoencoders on single observations (B, N), the
-    # exposures of all nights pooled. Decided by the model config alone.
-    datamodule = build_datamodule(
-        config.data, config.training, run_dir,
-        single_frame=config.model.single_frame,
-    )
+    datamodule = build_datamodule(config.data, config.training, run_dir)
     model = build_model(config.model, config.training)
 
     if args.predict is not None:

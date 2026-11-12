@@ -79,7 +79,7 @@ data:
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux (observed_key: null only)
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)
   # Metadata fed to the model (order = metadata vector order); must match
-  # model.metadata_dim. No time and no telluric parameters are read.
+  # model.metadata_dim.
   metadata_columns: [airmass, PWV]
   scale_metadata: true                   # metadata -> [0,1] with the bounds below
   metadata_bounds:

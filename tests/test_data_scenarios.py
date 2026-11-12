@@ -1,9 +1,10 @@
-"""End-to-end data scenarios: every supported combination of
+"""End-to-end data scenarios (single frames), every supported combination of
 
-* model:  single frame (CNN / transformer AE)  |  time series (whole-night)
-* input:  tellurics x star  |  observed flux from the file
-* noise:  Gaussian, 10% per pixel, on simulations only
-* real:   real observations (no target) -> predictions after training
+* simulations, tellurics x star (scaled PHOENIX star)   noisy | noiseless
+* simulations, observed flux stored in the file         noisy | noiseless
+* real observations (no target, no noise)  -> predictions after training
+
+for the CNN and transformer autoencoders, flat and night-major files.
 
 Each scenario builds a synthetic HDF5, runs the real ``TelluricDataModule``
 setup, one Lightning train/val step, and the real-observation prediction.
@@ -19,23 +20,17 @@ import pytorch_lightning as pl
 import torch
 
 import tellurics.data.datamodule as dm_module
-from tellurics.config import (
-    CNNAutoencoderConfig,
-    ModelConfig,
-    TransformerAutoencoderConfig,
-)
+from tellurics.config import CNNAutoencoderConfig, TransformerAutoencoderConfig
 from tellurics.config.data import DataConfig
-from tellurics.config.parameters import PHYSICAL_COLUMNS
 from tellurics.config.training import TrainingConfig
 from tellurics.data.datamodule import TelluricDataModule
 from tellurics.training.module import TelluricTrainingModule
 from tellurics.training.predict import predict_real_observations
-from tests._bounds import BOUNDS
 
 N = 64           # wavelength samples
 T = 4            # frames per night (night-major files)
 NIGHTS = 10
-FULL_BOUNDS = {**BOUNDS, "pwv": (0.0, 25.0)}
+FULL_BOUNDS = {"airmass": (1.0, 2.0), "pwv": (0.0, 25.0), "pressure": (600.0, 850.0)}
 
 
 # --------------------------------------------------------------------------- #
@@ -60,8 +55,8 @@ def _fake_stellar_pool(monkeypatch):
 
 
 def _labels(n_rows: int, rng) -> tuple[list[str], np.ndarray]:
-    """All physical columns, values inside FULL_BOUNDS."""
-    cols = list(PHYSICAL_COLUMNS)
+    """A few label columns, values inside FULL_BOUNDS."""
+    cols = list(FULL_BOUNDS)
     lab = np.empty((n_rows, len(cols)), np.float32)
     for j, c in enumerate(cols):
         lo, hi = FULL_BOUNDS[c]
@@ -106,23 +101,9 @@ def _single_frame_model(kind: str):
                                         wavelength_frequencies=3, **common)
 
 
-def _whole_night_model(use_stellar: bool) -> ModelConfig:
-    return ModelConfig(
-        architecture="neural_telluric_predictor", num_wavelength_bins=N,
-        n_frames_per_series=T, metadata_dim=3, use_stellar=use_stellar,
-        num_queries=2, spectral_latent_dim=8, num_heads=2, dropout=0.0,
-        x_encoder_channels=[4], x_encoder_kernel=3, x_encoder_stride=2,
-        s_encoder_channels=[4], s_encoder_kernel=3, s_encoder_stride=2,
-        encoder_pool_bins=2, fusion_hidden=0, fusion_layers=1,
-        metadata_enc_dim=4, metadata_enc_hidden=None, time_enc_dim=4,
-        telluric_decoder_hidden=None, telluric_activation="optical_depth",
-    )
-
-
-def _run(model_cfg, data_cfg, tmp_path, single_frame: bool):
+def _run(model_cfg, data_cfg, tmp_path):
     """setup -> one train/val step -> predict data.real."""
-    dm = TelluricDataModule(data_cfg, run_dir=tmp_path, batch_size=2,
-                            num_workers=0, single_frame=single_frame)
+    dm = TelluricDataModule(data_cfg, run_dir=tmp_path, batch_size=2, num_workers=0)
     dm.setup()
     module = TelluricTrainingModule(model_cfg, TrainingConfig(max_epochs=1, precision="32"))
     trainer = pl.Trainer(fast_dev_run=True, logger=False, enable_checkpointing=False,
@@ -134,65 +115,48 @@ def _run(model_cfg, data_cfg, tmp_path, single_frame: bool):
 
 
 # --------------------------------------------------------------------------- #
-# 1. frames or time series  x  2. tellurics*star or observed (+ noise)
-#                           x  3. simulations (noise) + real (no noise, no target)
+# simulations: tellurics x star | observed  x  noisy | noiseless;  + real
 # --------------------------------------------------------------------------- #
-SINGLE = [("cnn", False), ("cnn", True), ("tae", False), ("tae", True)]
+META = dict(metadata_columns=["airmass", "pwv"],
+            metadata_bounds={"airmass": FULL_BOUNDS["airmass"], "pwv": FULL_BOUNDS["pwv"]})
+NOISY = dict(noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2)
 
 
-@pytest.mark.parametrize("kind, observed", SINGLE)
-def test_single_frame_scenarios(tmp_path, kind, observed) -> None:
+@pytest.mark.parametrize("kind", ["cnn", "tae"])
+@pytest.mark.parametrize("observed", [False, True], ids=["tellurics_x_star", "observed"])
+@pytest.mark.parametrize("noisy", [True, False], ids=["noisy", "noiseless"])
+@pytest.mark.parametrize("flat", [True, False], ids=["flat", "night_major"])
+def test_frame_scenarios(tmp_path, kind, observed, noisy, flat) -> None:
     sim, real = tmp_path / "sim.h5", tmp_path / "real.h5"
-    _write(sim, flat=True, observed=observed)
-    _write(real, flat=True, observed=True, target=False, seed=1)
+    _write(sim, flat=flat, observed=observed)
+    _write(real, flat=flat, observed=True, target=False, seed=1)
     data = DataConfig(
-        night_h5=sim, observed_key="observed" if observed else None,
-        simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2,
-        metadata_columns=["airmass", "pwv"],
-        metadata_bounds={"airmass": FULL_BOUNDS["airmass"], "pwv": FULL_BOUNDS["pwv"]},
+        night_h5=sim, observed_key="observed" if observed else None, simulated=True,
         real=[{"name": "obs1", "night_h5": real, "observed_key": "observed"}],
+        **META, **(NOISY if noisy else {}),
     )
-    dm, module, written = _run(_single_frame_model(kind), data, tmp_path, single_frame=True)
+    dm, module, written = _run(_single_frame_model(kind), data, tmp_path)
 
     x = dm.train_ds[0]
     assert x["observed"].shape == (N,) and x["telluric"].shape == (N,)
+    assert set(x["theta"]) == {"metadata"}
     assert ("stellar" in x) is (not observed)                 # stars only for tellurics
     assert (tmp_path / "stellar_assignment.csv").exists() is (not observed)
+    assert ("noise_level" in x) is noisy
+    assert len(dm.train_ds) == dm.train_ds._n_base() * (2 if noisy else 1)
 
-    # predictions for every real observation, no target needed
-    with h5py.File(written[0]) as f, h5py.File(real) as r:
-        assert f["telluric_pred"].shape == r["observed"].shape
-        assert f["frame_id"].shape == (r["observed"].shape[0],)
-        rows = dm.real_ds["obs1"]
-        assert np.allclose(f["observed"][:], np.stack([rows[i]["observed"] for i in range(len(rows))]))
+    # noiseless: the input is exactly flux x star, or the stored observed flux
+    if not noisy:
+        expected = x["telluric"] * x["stellar"] if not observed else x["telluric"] * 3.0
+        assert torch.allclose(x["observed"], expected)
 
-
-@pytest.mark.parametrize("observed", [False, True])
-def test_time_series_scenarios(tmp_path, observed) -> None:
-    sim, real = tmp_path / "sim.h5", tmp_path / "real.h5"
-    _write(sim, flat=False, observed=observed)
-    _write(real, flat=False, observed=True, target=False, seed=1)
-    data = DataConfig(
-        night_h5=sim, observed_key="observed" if observed else None,
-        simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2, param_bounds=FULL_BOUNDS,
-        real=[{"name": "obs1", "night_h5": real, "observed_key": "observed"}],
-    )
-    # real observations have no stellar spectrum -> whole-night without stellar input
-    dm, module, written = _run(_whole_night_model(use_stellar=False), data, tmp_path,
-                               single_frame=False)
-    x = dm.train_ds[0]
-    assert x["observed"].shape == (T, N) and x["telluric"].shape == (T, N)
-    with h5py.File(written[0]) as f:
-        assert f["telluric_pred"].shape == (NIGHTS, T, N)
-
-
-def test_time_series_with_stellar_input(tmp_path) -> None:
-    sim = tmp_path / "sim.h5"
-    _write(sim, flat=False, observed=False)
-    data = DataConfig(night_h5=sim, simulated=True, noise_level_mean=0.01, noise_level_std=0.001, noise_repeats=2, param_bounds=FULL_BOUNDS)
-    dm, module, written = _run(_whole_night_model(use_stellar=True), data, tmp_path,
-                               single_frame=False)
-    assert "stellar" in dm.train_ds[0] and written == []
+    # real observations: every one predicted, no target, no noise, no star
+    r = dm.real_ds["obs1"][0]
+    assert "telluric" not in r and "stellar" not in r and "noise_level" not in r
+    with h5py.File(written[0]) as f, h5py.File(real) as src:
+        n_obs = int(np.prod(src["observed"].shape[:-1]))
+        assert f["telluric_pred"].shape == (n_obs, N)
+        assert f["frame_id"].shape == (n_obs,)
 
 
 # --------------------------------------------------------------------------- #
@@ -209,7 +173,7 @@ def _noise_dm(tmp_path, simulated=True, mean=0.01, std=0.001, repeats=1, real=Fa
         metadata_bounds={"airmass": FULL_BOUNDS["airmass"], "pwv": FULL_BOUNDS["pwv"]},
         real=[{"name": "obs1", "night_h5": rl}] if real else [],
     )
-    dm = TelluricDataModule(data, run_dir=tmp_path, num_workers=0, single_frame=True)
+    dm = TelluricDataModule(data, run_dir=tmp_path, num_workers=0)
     dm.setup()
     return dm, sim, rl
 
@@ -269,11 +233,11 @@ def test_target_key_selects_the_hdf5_dataset(tmp_path) -> None:
         del f["flux"]
     kw = dict(night_h5=sim, observed_key="observed", metadata_columns=["airmass", "pwv"],
               metadata_bounds={"airmass": (1, 2), "pwv": (0, 25)})
-    dm = TelluricDataModule(DataConfig(**kw), run_dir=tmp_path, num_workers=0, single_frame=True)
+    dm = TelluricDataModule(DataConfig(**kw), run_dir=tmp_path, num_workers=0)
     with pytest.raises(KeyError, match="target_key"):
         dm.setup()
     dm = TelluricDataModule(DataConfig(target_key="transmission", **kw), run_dir=tmp_path,
-                            num_workers=0, single_frame=True)
+                            num_workers=0)
     dm.setup()
     assert dm.train_ds[0]["telluric"].shape == (N,)
 
@@ -323,6 +287,6 @@ def test_real_file_must_match_the_wavelength_grid(tmp_path) -> None:
     data = DataConfig(night_h5=sim, observed_key="observed", metadata_columns=["airmass", "pwv"],
                       metadata_bounds={"airmass": (1, 2), "pwv": (0, 25)},
                       real=[{"name": "bad", "night_h5": rl}])
-    dm = TelluricDataModule(data, run_dir=tmp_path, num_workers=0, single_frame=True)
+    dm = TelluricDataModule(data, run_dir=tmp_path, num_workers=0)
     with pytest.raises(ValueError, match="wavelength samples"):
         dm.setup()

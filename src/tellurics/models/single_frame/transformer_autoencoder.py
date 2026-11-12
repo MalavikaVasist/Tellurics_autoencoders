@@ -11,7 +11,7 @@ exposure's metadata (``data.metadata_columns``, e.g. airmass + PWV).
   patch's features to ``d_model``. The decoder's per-patch queries are built
   from the same wavelength features, so both sides know *where on the
   spectrum* every token sits.
-* **Metadata as a token.** As in the whole-night model, the metadata goes
+* **Metadata as a token.** The metadata goes
   through the shared :class:`~tellurics.models.metadata.MetadataEncoder`
   (to ``metadata_enc_dim``, then a Linear to ``d_model``) and is concatenated
   to the sequence as one extra
