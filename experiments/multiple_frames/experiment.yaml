@@ -37,6 +37,8 @@ model:
   num_queries: 16                        # learned latent tokens Q (temporal)
   spectral_latent_dim: 64                # per-exposure spectral code dim d
   metadata_dim: 3                        # per-exposure metadata width P (B, T, P)
+  use_stellar: true                      # stellar spectrum as an input (needs observed_key: null and no data.real);
+                                         # false for observed-flux data / real observations
   metadata_enc_dim: 16                   # encoded metadata code width C
   metadata_enc_hidden: null              # metadata MLP hidden (null -> auto)
   time_enc_dim: 16                       # width of the per-exposure time code
@@ -63,6 +65,22 @@ data:
   # on every machine; the paths below are relative to it.
   root: "${TELLURICS_DATA}"
   night_h5: telluric_timeseries/telluric_templates_nights.h5   # built by tests/testing_dataset_reshape.ipynb
+  # Model input of night_h5 ('transmission' is always the target):
+  #   null      -- pure tellurics: every night gets a fixed star from
+  #                phoenix_dir and observed = transmission * star
+  #   "<name>"  -- the observed flux is already in the file under that
+  #                dataset name; no stars are loaded, assigned or multiplied
+  observed_key: null
+  simulated: true                        # night_h5 is simulated -> gets the noise below
+  noise_sigma: 0.1                       # Gaussian input noise, sigma = 10% of each pixel (simulations only)
+  # Real observations: observed flux, no telluric target. Not trained on, not
+  # noised; after training the best model predicts their tellurics into
+  # <run_dir>/predictions/<name>.h5 (or: train --predict CKPT). Example:
+  #   real:
+  #     - name: harps_2024
+  #       night_h5: real/harps_2024.h5   # observed flux + wavelength + labels
+  #       observed_key: observed
+  real: []
   phoenix_dir: phoenix/convolved    # stellar *.fits pool
   stellar_scale: true                    # normalize each stellar spectrum to unit mean flux
   max_nights: 10000                        # subset: first 100 nights only (not a random sample)

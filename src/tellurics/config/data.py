@@ -2,8 +2,6 @@ from pathlib import Path
 
 import math
 
-from typing import Literal
-
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tellurics.config.parameters import (
@@ -15,21 +13,44 @@ from tellurics.config.parameters import (
 from tellurics.config.paths import data_root
 
 
+class RealSource(BaseModel):
+    """A file of real observations: observed flux, no telluric target.
+
+    Never trained on and never noised: after training, the best model
+    predicts its tellurics into ``<run_dir>/predictions/<name>.h5``.
+    """
+
+    name: str = Field(min_length=1, description="Name of the output file.")
+    night_h5: Path = Field(description="HDF5 (relative to data.root): the "
+                                       "observed flux, wavelength, labels.")
+    observed_key: str = "observed"           # HDF5 dataset of the observed flux
+
+
 class DataConfig(BaseModel):
     root: Path = Field(default_factory=data_root)
     night_h5: Path = Path("telluric_timeseries/telluric_templates_nights.h5")
     phoenix_dir: Path = Path("phoenix/convolved")
 
-    # What the HDF5 holds:
-    #   "tellurics" -- pure telluric transmission (``transmission``); each
-    #       night gets a fixed PHOENIX star and observed = transmission * star.
-    #   "observed"  -- the observed flux is already in the file (under
-    #       ``observed_key``); no stellar spectra are loaded or assigned and
-    #       nothing is multiplied. ``transmission`` is still the target.
-    input: Literal["tellurics", "observed"] = "tellurics"
-    observed_key: str = "observed"          # HDF5 dataset of the observed flux (input: observed)
+    # Model input of night_h5 (the training data; 'transmission' is always
+    # the target):
+    #   null  -- night_h5 holds pure tellurics: every night gets a fixed
+    #            PHOENIX star and observed = transmission * star
+    #   "<name>" -- night_h5 already holds the observed flux in that dataset:
+    #            no stellar spectra are loaded, assigned or multiplied
+    observed_key: str | None = None
 
-    stellar_scale: bool = True              # input: tellurics only
+    # Is night_h5 simulated? Only simulated inputs get noise.
+    simulated: bool = True
+    # Gaussian noise added to simulated inputs, relative per pixel:
+    # observed + N(0, (noise_sigma * observed)^2). 0 -> no noise. Training
+    # draws fresh noise every time; validation/test use fixed, seeded noise.
+    noise_sigma: float = Field(default=0.0, ge=0.0)
+
+    # Real observations (observed flux, no telluric target): not trained on,
+    # not noised; predicted after training.
+    real: list[RealSource] = Field(default_factory=list)
+
+    stellar_scale: bool = True              # observed_key: null only
     scale_metadata: bool = True
     # Label columns fed to the model as metadata (order = metadata vector
     # order). Default: pressure, temperature, humidity; the single-frame
@@ -75,6 +96,16 @@ class DataConfig(BaseModel):
     def resolve_paths(self) -> "DataConfig":
         self.night_h5 = self._resolve(self.night_h5)
         self.phoenix_dir = self._resolve(self.phoenix_dir)
+        for source in self.real:
+            source.night_h5 = self._resolve(source.night_h5)
+        names = [r.name for r in self.real]
+        if len(set(names)) != len(names):
+            raise ValueError(f"data.real names must be unique: {names}")
+        if self.noise_sigma > 0 and not self.simulated:
+            raise ValueError(
+                "data.noise_sigma > 0 but data.simulated is false: noise is "
+                "only added to simulations"
+            )
 
         if (self.param_bounds is None) == (self.metadata_bounds is None):
             raise ValueError(

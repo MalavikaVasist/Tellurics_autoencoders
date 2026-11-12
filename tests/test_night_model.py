@@ -126,7 +126,7 @@ class TestNeuralTelluricPredictorShapes:
             model(observed, stellar=stellar, metadata=metadata)
         with pytest.raises(NameError):       # no metadata -> code left unbound
             model(observed, stellar=stellar, time=hours)
-        with pytest.raises(AttributeError):  # no stellar -> None.shape
+        with pytest.raises(ValueError, match="use_stellar"):  # no stellar with use_stellar
             model(observed, metadata=metadata, time=hours)
 
     def test_unbatched_stellar_raises(self) -> None:

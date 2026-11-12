@@ -64,15 +64,26 @@ class ExperimentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _whole_night_model_needs_stars(self) -> "ExperimentConfig":
-        """The whole-night model takes the stellar spectrum as an input."""
-        if not self.model.single_frame and self.data.input == "observed":
+    def _stellar_input_matches_the_data(self) -> "ExperimentConfig":
+        """The whole-night model's stellar input needs stars in the data.
+
+        With ``model.use_stellar`` it takes the stellar spectrum as an input,
+        which only pure-telluric data (``data.observed_key: null``) provides;
+        observed-flux data and real observations need ``use_stellar: false``.
+        """
+        if self.model.single_frame or not self.model.use_stellar:
+            return self
+        if self.data.observed_key is not None:
             raise ValueError(
-                f"model {self.model.architecture.value} needs the stellar "
-                "spectrum as an input: use data.input: tellurics"
+                "data.observed_key is set (observed flux, no stellar spectrum) "
+                "but model.use_stellar is true: set model.use_stellar: false"
+            )
+        if self.data.real:
+            raise ValueError(
+                "data.real observations have no stellar spectrum: set "
+                "model.use_stellar: false to predict them with the whole-night model"
             )
         return self
-
 
 def load_config(path: str | Path | None) -> ExperimentConfig:
     """

@@ -165,8 +165,11 @@ class NeuralTelluricPredictor(nn.Module):
         c = config.metadata_enc_dim                     # metadata code width C
         k = config.time_enc_dim                         # time-code width k
         fusion_hidden = config.fusion_hidden or (q * d)      # default 1024
-        fusion_in = q * d + d                                # 1024 + 64 (h_X + h_S)
+        self.use_stellar = config.use_stellar
+        # 1024 + 64 (h_X + h_S), or 1024 (h_X only) without a stellar input
+        fusion_in = q * d + (d if self.use_stellar else 0)
         fusion_out = q * d                                   # 1024 == 16*64
+        self.fusion_in = fusion_in
 
         # 1. shared spectral CNN over the exposures of X
         self.spectral_encoder = SpectralEncoder(
@@ -192,11 +195,15 @@ class NeuralTelluricPredictor(nn.Module):
         self.temporal_perceiver = TemporalPerceiver(
             q, d, heads, config.dropout
         )
-        # 4. independent stellar encoder for S (own weights)
-        self.stellar_encoder = StellarEncoder(
-            n_w, d, config.s_encoder_channels,
-            config.s_encoder_kernel, config.s_encoder_stride, config.dropout,
-            config.encoder_pool_bins,
+        # 4. independent stellar encoder for S (own weights); absent when
+        #    the data carries no separate stellar spectrum (use_stellar=False)
+        self.stellar_encoder = (
+            StellarEncoder(
+                n_w, d, config.s_encoder_channels,
+                config.s_encoder_kernel, config.s_encoder_stride, config.dropout,
+                config.encoder_pool_bins,
+            )
+            if self.use_stellar else None
         )
         # 6. fusion MLP
         self.fusion = FusionMLP(
@@ -321,22 +328,25 @@ class NeuralTelluricPredictor(nn.Module):
         # 3. flatten X representation  (16 * 64 == 1024)
         h_x = l.reshape(batch, self.q * self.d)      # (B, 1024)
 
-        # 4. stellar code (separate encoder, own weights)
-        s = stellar
-        if s.shape != (batch, self.n_wavelength):
-            raise ValueError(
-                f"stellar must be ({batch}, {self.n_wavelength}) "
-                f"got {tuple(stellar.shape)}"
-            )
-        h_s = self.stellar_encoder(s)            # (B, d)
-
-        assert h_s.shape == (batch, self.d), h_s.shape
-
-        # 6. fusion  concat[h_X, h_S] -> MLP -> h_fused (B, q*d)
-        #    (metadata enters earlier, concatenated with the spectral codes
-        #    feeding the Perceiver, not here)
-        fusion_vec = torch.cat([h_x, h_s], dim=-1)   # (B, q*d + d) = (B, 1088)
-        assert fusion_vec.shape == (batch, self.q * self.d + self.d,), fusion_vec.shape
+        # 4. stellar code (separate encoder, own weights) -- only with a
+        #    stellar input (use_stellar); observed-flux data has none
+        if self.use_stellar:
+            s = stellar
+            if s is None or s.shape != (batch, self.n_wavelength):
+                raise ValueError(
+                    f"stellar must be ({batch}, {self.n_wavelength}); got "
+                    f"{None if s is None else tuple(s.shape)} "
+                    "(set model.use_stellar: false for observed-flux data)"
+                )
+            h_s = self.stellar_encoder(s)            # (B, d)
+            assert h_s.shape == (batch, self.d), h_s.shape
+            # 6. fusion  concat[h_X, h_S] -> MLP -> h_fused (B, q*d)
+            #    (metadata enters earlier, concatenated with the spectral codes
+            #    feeding the Perceiver, not here)
+            fusion_vec = torch.cat([h_x, h_s], dim=-1)   # (B, q*d + d) = (B, 1088)
+        else:
+            fusion_vec = h_x                             # (B, q*d)
+        assert fusion_vec.shape == (batch, self.fusion_in), fusion_vec.shape
         h_fused = self.fusion(fusion_vec)            # (B, q*d) == (B, 1024)
         assert h_fused.shape == (batch, self.q * self.d), h_fused.shape
 
@@ -363,7 +373,7 @@ class NeuralTelluricPredictor(nn.Module):
             "tokens": tokens_concat,     # (B, T, d + C + k) concatenated codes
             "l": l,                      # (B, Q, d)
             "h_x": h_x,                  # (B, q*d)
-            "h_s": h_s,                  # (B, d)
+            "h_s": h_s if self.use_stellar else None,   # (B, d) or None
             "fusion": fusion_vec,        # (B, q*d + d)
             "h_fused": h_fused,          # (B, q*d)
             "latent": latent,            # (B, Q, d)

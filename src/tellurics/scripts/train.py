@@ -65,6 +65,7 @@ import argparse
 from pathlib import Path
 
 import pytorch_lightning as pl
+import torch
 import yaml
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -83,6 +84,7 @@ from tellurics.config import (
 )
 from tellurics.data.datamodule import TelluricDataModule
 from tellurics.training.module import TelluricTrainingModule
+from tellurics.training.predict import load_trained_module, predict_real_observations
 from tellurics.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -120,6 +122,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--predict",
+        type=Path,
+        default=None,
+        metavar="CKPT",
+        help="skip training: load this checkpoint and predict the data.real "
+             "observations into <run_dir>/predictions/",
+    )
     return parser.parse_args()
 
 
@@ -167,11 +177,18 @@ def build_datamodule(
             "the data directory and that the file exists. Create it once with "
             "tests/testing_dataset_reshape.ipynb."
         )
-    if not data.phoenix_dir.is_dir():
+    # Stellar spectra are only needed for pure-telluric data (observed_key: null).
+    if data.observed_key is None and not data.phoenix_dir.is_dir():
         raise FileNotFoundError(
             f"Phoenix stellar pool directory not found at {data.phoenix_dir}. "
             "It is resolved relative to $TELLURICS_DATA."
         )
+    for source in data.real:
+        if not source.night_h5.exists():
+            raise FileNotFoundError(
+                f"data.real '{source.name}' not found at {source.night_h5} "
+                "(resolved relative to $TELLURICS_DATA)"
+            )
     return TelluricDataModule(
         data,
         run_dir=run_dir,
@@ -277,6 +294,15 @@ def train(
         ckpt_path=None if resume is None else str(resume),
     )
 
+    # Real observations (data.real): predicted with the best checkpoint.
+    if getattr(datamodule, "real_ds", None):
+        best = getattr(trainer.checkpoint_callback, "best_model_path", "") or ""
+        module = (
+            load_trained_module(best, map_location=model.device)
+            if best else model
+        )
+        predict_real_observations(module, datamodule, run_dir)
+
 
 
 def apply_overrides(
@@ -341,6 +367,19 @@ def main() -> None:
         single_frame=config.model.single_frame,
     )
     model = build_model(config.model, config.training)
+
+    if args.predict is not None:
+        # Prediction only: real observations with a trained checkpoint.
+        if not args.predict.exists():
+            raise FileNotFoundError(f"checkpoint not found: {args.predict}")
+        datamodule.setup()
+        if not datamodule.real_ds:
+            raise ValueError("--predict needs data.real observations in the config")
+        module = load_trained_module(args.predict, map_location="cpu")
+        if torch.cuda.is_available() and args.device != "cpu":
+            module = module.cuda()
+        predict_real_observations(module, datamodule, run_dir)
+        return
 
     train(
         model=model,

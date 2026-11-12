@@ -683,7 +683,7 @@ class TestNoParameters:
 
 
 # --------------------------------------------------------------------------- #
-# data.input: observed -- the file already holds the observed flux
+# data.observed_key set -- the file already holds the observed flux
 # --------------------------------------------------------------------------- #
 def _write_observed_flat_file(path, frames=FLAT_FRAMES, key="observed", bad_shape=False) -> None:
     """Flat file with 'observed' (input) and 'transmission' (target), no stars."""
@@ -698,17 +698,22 @@ def _write_observed_flat_file(path, frames=FLAT_FRAMES, key="observed", bad_shap
 
 def _observed_config(path, **kw) -> DataConfig:
     return DataConfig(
-        night_h5=path, input="observed", metadata_columns=["airmass", "pwv"],
-        metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)}, **kw,
+        night_h5=path, metadata_columns=["airmass", "pwv"],
+        metadata_bounds={"airmass": (1.0, 2.0), "pwv": (0.0, 25.0)},
+        **{"observed_key": "observed", **kw},
     )
 
 
 class TestObservedInput:
-    def test_single_frame_manifests_default_to_tellurics(self) -> None:
-        for f in ("experiment_cnn_ae.yaml", "experiment_transformer_ae.yaml",
-                  "experiment_specpt.yaml"):
-            data = load_config(REPO / "experiments" / "single_frame" / f).data
-            assert data.input == "tellurics" and data.observed_key == "observed"
+    def test_manifests_default_to_tellurics_with_noise_on_simulations(self) -> None:
+        for f in ("single_frame/experiment_cnn_ae.yaml",
+                  "single_frame/experiment_transformer_ae.yaml",
+                  "single_frame/experiment_specpt.yaml",
+                  "multiple_frames/experiment.yaml"):
+            data = load_config(REPO / "experiments" / f).data
+            assert data.observed_key is None                 # tellurics x star
+            assert data.simulated and data.noise_sigma == 0.1
+            assert data.real == []
 
     def test_full_setup_without_any_stellar_spectra(self, tmp_path) -> None:
         """setup() runs with no phoenix_dir: no pool, no assignment, no audit CSV."""
@@ -781,13 +786,15 @@ class TestObservedInput:
         with pytest.raises(ValueError, match="shape"):
             dm.setup()
 
-    def test_whole_night_model_rejects_observed_input(self) -> None:
+    def test_whole_night_observed_input_needs_use_stellar_false(self) -> None:
         raw = load_config(
             REPO / "experiments" / "multiple_frames" / "experiment.yaml"
         ).model_dump(mode="json")
-        raw["data"]["input"] = "observed"
-        with pytest.raises(ValidationError, match="stellar"):
+        raw["data"]["observed_key"] = "observed"
+        with pytest.raises(ValidationError, match="use_stellar"):
             ExperimentConfig(**raw)
+        raw["model"]["use_stellar"] = False
+        assert ExperimentConfig(**raw).model.use_stellar is False
 
     def test_tellurics_input_still_needs_stars(self, tmp_path) -> None:
         path = tmp_path / "flat.h5"

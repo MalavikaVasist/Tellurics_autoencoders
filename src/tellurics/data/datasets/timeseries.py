@@ -109,11 +109,24 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         target_columns: tuple[str, ...] | list[str] | None = None,
         time_column: str | None = TIME_COLUMN,
         observed_key: str | None = None,
+        noise_sigma: float = 0.0,
+        noise_seed: int | None = None,
+        has_target: bool = True,
     ) -> None:
         super().__init__()
         # observed_key set -> the file already holds the observed flux under
-        # that key (data.input: observed): no stars are assigned or multiplied.
+        # that key: no stars are assigned or multiplied.
         self.observed_key = observed_key
+        # Gaussian noise on the input, relative per pixel (simulations only):
+        # noise_seed None -> fresh noise on every read (training); an int ->
+        # the same noise for a sample on every read (validation / test).
+        self.noise_sigma = float(noise_sigma)
+        self.noise_seed = noise_seed
+        # has_target False -> real observations: no 'transmission' is read and
+        # samples carry no 'telluric' (prediction only).
+        self.has_target = has_target
+        if not has_target and observed_key is None:
+            raise ValueError("target-free (real) data must give observed_key")
         if observed_key is None and (pool is None or star_assignment is None):
             raise ValueError(
                 "pure-telluric data needs a stellar pool and a star assignment "
@@ -185,25 +198,60 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
         with self._open() as f:
             return torch.from_numpy(np.asarray(f["wavelength"][:], np.float32))
 
+    # -- input construction shared with TelluricFrameDataset -------------- #
+    def _read(self, f, at) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None]:
+        """``(transmission | None, labels, stored observed flux | None)`` at ``at``."""
+        trans = (
+            np.asarray(f["transmission"][at], np.float32) if self.has_target else None
+        )
+        lab = np.asarray(f["labels"][at], np.float32)
+        observed = (
+            np.asarray(f[self.observed_key][at], np.float32)
+            if self.observed_key is not None else None
+        )
+        return trans, lab, observed
+
+    def _input(
+        self, idx: int, night: int, trans: np.ndarray | None, stored: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None, int | None]:
+        """The model input ``(observed, star spectrum | None, star index | None)``.
+
+        Stored observed flux is used as is; otherwise ``transmission * S`` with
+        the night's fixed star. Then the (simulation-only) noise is added.
+        """
+        s = star_idx = None
+        if stored is not None:
+            observed = stored
+        else:
+            star_idx = int(self.star_assignment[night])               # same star for the whole night
+            s, _ = self.pool[star_idx]                                # (N,)
+            observed = trans * s[None, :]
+        if self.noise_sigma > 0:
+            rng = (
+                np.random.default_rng() if self.noise_seed is None
+                else np.random.default_rng([self.noise_seed, int(idx)])
+            )
+            noise = rng.standard_normal(observed.shape).astype(np.float32)
+            observed = observed + self.noise_sigma * observed * noise
+        return observed, s, star_idx
+
+    def _check_finite(self, what: str, *arrays: np.ndarray | None) -> None:
+        if not all(np.isfinite(a).all() for a in arrays if a is not None):
+            raise ValueError(
+                f"non-finite values in {what} of {self.h5_path}: padded frames "
+                "must not be stored -- use the flat layout (one row per real "
+                "observation)"
+            )
+
     def __len__(self) -> int:
         return len(self.night_ids)
 
     def __getitem__(self, idx: int) -> dict[str, object]:
         night = self.night_ids[idx]
-        if self.observed_key is not None:
-            raise NotImplementedError(
-                "whole-night samples need the stellar spectrum: data.input: "
-                "observed is for the single-frame models"
-            )
-        star_idx = int(self.star_assignment[night])
-        s, _ = self.pool[star_idx]                    # (N,) float32
-
         with self._open() as f:
-            trans = np.asarray(f["transmission"][night], np.float32)   # (T, N)
-            lab = np.asarray(f["labels"][night], np.float32)           # (T, P)
-
-        s_t = s[None, :]                              # (1, N)
-        observed = trans * s_t                        # (T, N)
+            trans, lab, stored = self._read(f, night)                   # (T, N), (T, P)
+        observed, s, star_idx = self._input(idx, night, trans, stored)  # (T, N)
+        self._check_finite(f"night {night}", trans, observed)
 
         # Slice ``time_hours`` as (T, 1) so every group handed to the scaler is
         # 2-D ``(T, P)``; it is squeezed back to (T,) for the model afterwards.
@@ -211,7 +259,7 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
             lab[:, [self._time_idx]] if self._time_idx is not None
             else np.zeros((lab.shape[0], 1), np.float32)                # no time column
         )                                                               # (T, 1)
-        metadata = lab[:, self._metadata_idx]                           # (T, 3)
+        metadata = lab[:, self._metadata_idx]                           # (T, M)
         output_params = lab[:, self._target_idx]                        # (T, P)
 
         if self.scaler is not None:
@@ -221,10 +269,8 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
 
         time = time[:, 0]                                               # (T,)
 
-        return {
+        sample = {
             "observed": torch.from_numpy(observed),
-            "stellar": torch.from_numpy(s),
-            "telluric": torch.from_numpy(trans),
             "wavelength": self.wavelength,
             "theta": {
                 "time": torch.from_numpy(time),
@@ -232,5 +278,10 @@ class TelluricTimeseriesDataset(Dataset[dict[str, object]]):
                 "output_params": torch.from_numpy(output_params),
             },
             "night_id": night,
-            "star_index": star_idx,
         }
+        if trans is not None:
+            sample["telluric"] = torch.from_numpy(trans)           # target
+        if s is not None:
+            sample["stellar"] = torch.from_numpy(s)
+            sample["star_index"] = star_idx
+        return sample

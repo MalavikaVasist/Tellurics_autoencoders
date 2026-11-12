@@ -74,6 +74,13 @@ class ModelConfig(BaseModel):
         description="Per-exposure metadata width P (data contract: 3 -> "
                     "pressure, temperature, humidity).",
     )
+    use_stellar: bool = Field(
+        default=True,
+        description="Feed the night's stellar spectrum through the "
+                    "StellarEncoder into the fusion. False for observed-flux "
+                    "data (data.observed_key set) and real observations, "
+                    "which carry no separate stellar spectrum.",
+    )
 
     # -- architecture geometry -------------------------------------------- #
     num_queries: int = Field(gt=0, description="Number of learned Perceiver latents (Q).")

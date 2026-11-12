@@ -14,6 +14,7 @@ Each night is paired with one fixed, seeded stellar spectrum:
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +73,41 @@ def build_scaler(config: DataConfig, *, clip: bool = False) -> ParameterScaler:
     )
 
 
+
+def read_layout(path: Path, shape_key: str) -> dict:
+    """Layout of a telluric HDF5, from the dataset ``shape_key``.
+
+    Returns ``flat`` (one row per observation), ``n_nights``, and either
+    ``rows`` / ``series`` (flat: rows per night, grouped by ``series_index``;
+    nights may have different numbers of frames) or ``n_frames`` (night-major
+    ``(n_nights, T, N)``), plus the wavelength grid ``wavelength`` / ``unit``.
+    """
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        if shape_key not in f:
+            raise KeyError(f"{path} has no '{shape_key}' dataset; datasets: {list(f.keys())}")
+        shape = f[shape_key].shape
+        out: dict = {"flat": len(shape) == 2, "n_samples": int(shape[-1])}
+        if out["flat"]:
+            columns = read_label_columns(path)
+            if "series_index" not in columns:
+                raise KeyError(
+                    f"flat HDF5 {path} needs a 'series_index' label column "
+                    f"to group observations into nights; columns: {columns}"
+                )
+            series = np.asarray(f["labels"][:, columns.index("series_index")]).astype(np.int64)
+            ids, inverse = np.unique(series, return_inverse=True)
+            order = np.argsort(inverse, kind="stable")
+            bounds = np.cumsum(np.bincount(inverse, minlength=len(ids)))[:-1]
+            out.update(rows=np.split(order, bounds), series=ids, n_nights=len(ids))
+        else:
+            out.update(n_nights=int(shape[0]), n_frames=int(shape[1]))
+        out["wavelength"] = np.asarray(f["wavelength"][:], np.float64)
+        out["unit"] = str(f["wavelength"].attrs.get("unit", "nm"))
+    return out
+
+
 class TelluricDataModule(pl.LightningDataModule):
     """Whole-night DataModule for training the :class:`NeuralTelluricPredictor`.
 
@@ -119,6 +155,7 @@ class TelluricDataModule(pl.LightningDataModule):
     train_ds: TelluricTimeseriesDataset | None = None
     val_ds: TelluricTimeseriesDataset | None = None
     test_ds: TelluricTimeseriesDataset | None = None
+    real_ds: dict[str, TelluricTimeseriesDataset] = {}   # data.real, prediction only
 
     # -- setup -------------------------------------------------------------- #
     def setup(self, stage: str | None = None) -> None:
@@ -132,17 +169,18 @@ class TelluricDataModule(pl.LightningDataModule):
         if self.observed_input:
             # The file already holds the observed flux: no stellar spectra.
             logger.info(
-                f"data.input = observed: reading '{self.config.observed_key}' "
-                "as the observed flux; no stellar spectra assigned"
+                f"data.observed_key = '{self.config.observed_key}': reading the "
+                "observed flux from the file; no stellar spectra assigned"
             )
         else:
             self._assign_stars()   # fixed stellar spectrum per night + audit CSV
         self._make_datasets()  # one dataset per split
+        self._make_real_datasets()  # data.real: prediction-only observations
 
     @property
     def observed_input(self) -> bool:
-        """``data.input: observed`` -- the HDF5 already holds the observed flux."""
-        return self.config.input == "observed"
+        """``data.observed_key`` set -- the HDF5 already holds the observed flux."""
+        return self.config.observed_key is not None
 
     def _load_metadata(self) -> None:
         """Read the shapes and the wavelength grid."""
@@ -157,43 +195,28 @@ class TelluricDataModule(pl.LightningDataModule):
 
         import h5py
 
-        with h5py.File(night_h5, "r") as f:
-            flat = f["transmission"].ndim == 2
-            if self.observed_input:
-                key = self.config.observed_key
+        if self.observed_input:
+            key = self.config.observed_key
+            with h5py.File(night_h5, "r") as f:
                 if key not in f:
                     raise KeyError(
-                        f"data.input is 'observed' but {night_h5} has no '{key}' "
-                        f"dataset (data.observed_key); datasets: {list(f.keys())}"
+                        f"data.observed_key is '{key}' but {night_h5} has no "
+                        f"'{key}' dataset; datasets: {list(f.keys())}"
                     )
                 if f[key].shape != f["transmission"].shape:
                     raise ValueError(
                         f"'{key}' {f[key].shape} must have the shape of "
                         f"'transmission' {f['transmission'].shape} (the target)"
                     )
-            if flat:
-                # Flat layout: one row per observation; nights are the distinct
-                # series_index values and may have different numbers of frames.
-                columns = read_label_columns(night_h5)
-                if "series_index" not in columns:
-                    raise KeyError(
-                        f"flat HDF5 {night_h5} needs a 'series_index' label column "
-                        f"to group observations into nights; columns: {columns}"
-                    )
-                series = np.asarray(
-                    f["labels"][:, columns.index("series_index")]
-                ).astype(np.int64)
-                ids, inverse = np.unique(series, return_inverse=True)
-                order = np.argsort(inverse, kind="stable")
-                bounds = np.cumsum(np.bincount(inverse, minlength=len(ids)))[:-1]
-                rows = np.split(order, bounds)
-                available_nights = len(ids)
-                self.night_series = ids          # night position -> series_index
-            else:
-                available_nights = int(f["transmission"].shape[0])
-                self.n_frames = int(f["transmission"].shape[1])
-            wl = np.asarray(f["wavelength"][:], np.float64)
-            unit = str(f["wavelength"].attrs.get("unit", "nm"))
+        layout = read_layout(night_h5, "transmission")
+        flat = layout["flat"]
+        available_nights = layout["n_nights"]
+        if flat:
+            rows = layout["rows"]
+            self.night_series = layout["series"]   # night position -> series_index
+        else:
+            self.n_frames = layout["n_frames"]
+        wl, unit = layout["wavelength"], layout["unit"]
 
         # Debug/smoke runs may cap the nights used (the first N); the split and
         # the star assignment then only cover those nights.
@@ -305,15 +328,70 @@ class TelluricDataModule(pl.LightningDataModule):
         test_scaler = (
             None if self.scaler is None else build_scaler(self.config, clip=True)
         )
+        # Gaussian noise on simulated inputs only: fresh every read for
+        # training, fixed (seeded) for validation / test so their losses are
+        # comparable from epoch to epoch.
+        sigma = self.config.noise_sigma if self.config.simulated else 0.0
+        if sigma > 0:
+            logger.info(f"Gaussian input noise: {sigma:.0%} of each pixel (simulations)")
+        seed = self.config.seed
         self.train_ds = dataset_cls(
-            night_ids=self.train_ids, scaler=self.scaler, **common
+            night_ids=self.train_ids, scaler=self.scaler,
+            noise_sigma=sigma, noise_seed=None, **common
         )
         self.val_ds = dataset_cls(
-            night_ids=self.val_ids, scaler=self.scaler, **common
+            night_ids=self.val_ids, scaler=self.scaler,
+            noise_sigma=sigma, noise_seed=seed + 1, **common
         )
         self.test_ds = dataset_cls(
-            night_ids=self.test_ids, scaler=test_scaler, **common
+            night_ids=self.test_ids, scaler=test_scaler,
+            noise_sigma=sigma, noise_seed=seed + 2, **common
         )
+
+    def _make_real_datasets(self) -> None:
+        """One prediction-only dataset per ``data.real`` file.
+
+        Real observations: observed flux as stored, no target, no noise, no
+        stellar spectra. Every observation of the file is used. Labels are
+        scaled with the training bounds, clipped (real values may sit outside).
+        """
+        self.real_ds = {}
+        if not self.config.real:
+            return
+        scaler = None
+        if self.scaler is not None:
+            # real files carry no telluric parameters: drop that scaler group
+            scaler = dataclasses.replace(build_scaler(self.config, clip=True), params=None)
+        for source in self.config.real:
+            layout = read_layout(source.night_h5, source.observed_key)
+            if layout["n_samples"] != self.wavegrid.wavelength.size:
+                raise ValueError(
+                    f"data.real '{source.name}' has {layout['n_samples']} "
+                    f"wavelength samples; the training data has "
+                    f"{self.wavegrid.wavelength.size}"
+                )
+            common = dict(
+                night_ids=list(range(layout["n_nights"])),
+                h5_path=source.night_h5, pool=None, star_assignment=None,
+                scaler=scaler, observed_key=source.observed_key, has_target=False,
+                metadata_columns=tuple(self.config.metadata_columns),
+                target_columns=(), time_column=self.config.resolved_time_column,
+            )
+            if self.single_frame:
+                if layout["flat"]:
+                    common["night_rows"] = dict(enumerate(layout["rows"]))
+                else:
+                    common["n_frames"] = layout["n_frames"]
+                ds = TelluricFrameDataset(**common)
+            else:
+                if layout["flat"]:
+                    raise ValueError(
+                        f"data.real '{source.name}' is flat: the whole-night "
+                        "model needs the night-major (n_nights, T, N) layout"
+                    )
+                ds = TelluricTimeseriesDataset(**common)
+            self.real_ds[source.name] = ds
+            logger.info(f"real observations '{source.name}': {len(ds)} samples")
 
     # -- loaders ------------------------------------------------------------ #
     def _loader(self, ds: TelluricTimeseriesDataset, shuffle: bool) -> DataLoader:
@@ -337,3 +415,7 @@ class TelluricDataModule(pl.LightningDataModule):
 
     def predict_dataloader(self) -> DataLoader:
         return self._loader(self.test_ds, shuffle=False)
+
+    def real_dataloaders(self) -> dict[str, DataLoader]:
+        """``{name: loader}`` over the ``data.real`` observations (no shuffle)."""
+        return {name: self._loader(ds, shuffle=False) for name, ds in self.real_ds.items()}
