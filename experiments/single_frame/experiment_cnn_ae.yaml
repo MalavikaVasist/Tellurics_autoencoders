@@ -98,7 +98,7 @@ training:
   scheduler:
     scheduler_type: cosine               # SchedulerType enum value
     min_lr: 1e-6
-  max_epochs: 30                     # one epoch = every training observation x data.noise_repeats
+  max_epochs: 3                     # one epoch = every training observation x data.noise_repeats
   precision: 16-mixed                    # use "32" on a CPU-only machine
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1             # accumulate gradients over this many batches before stepping the optimizer
